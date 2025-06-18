@@ -44,6 +44,7 @@ class SpotifyService {
   private tokenExpiry: number | null = null;
   private artistGenresCache: Record<string, string[]> = {};
   private albumGenresCache: Record<string, string[]> = {};
+  private codeVerifier: string | null = null;
 
   // Secure storage keys
   private readonly ACCESS_TOKEN_KEY = 'spotify_access_token';
@@ -52,6 +53,30 @@ class SpotifyService {
 
   constructor() {
     this.loadTokensFromStorage();
+  }
+
+  // PKCE Helper Methods
+  private generateCodeVerifier(): string {
+    const array = new Uint8Array(32);
+    crypto.getRandomValues(array);
+    return this.base64URLEncode(array);
+  }
+
+  private async generateCodeChallenge(verifier: string): Promise<string> {
+    const hash = await Crypto.digestStringAsync(
+      Crypto.CryptoDigestAlgorithm.SHA256,
+      verifier,
+      { encoding: Crypto.CryptoEncoding.BASE64 }
+    );
+    // Convert base64 to base64url
+    return hash.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+  }
+
+  private base64URLEncode(buffer: Uint8Array): string {
+    return btoa(String.fromCharCode(...buffer))
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=/g, '');
   }
 
   private async loadTokensFromStorage(): Promise<void> {
@@ -119,7 +144,7 @@ class SpotifyService {
         body: new URLSearchParams({
           grant_type: 'refresh_token',
           refresh_token: this.refreshToken,
-          client_id: process.env.SPOTIFY_CLIENT_ID!,
+          client_id: SPOTIFY_CLIENT_ID,
         }),
       });
 
@@ -161,7 +186,7 @@ class SpotifyService {
     // If no valid token and no refresh token, perform full authentication
     try {
       const request = new AuthSession.AuthRequest({
-        clientId: process.env.SPOTIFY_CLIENT_ID!,
+        clientId: SPOTIFY_CLIENT_ID,
         scopes: [
           'user-read-private',
           'user-read-email',
@@ -170,20 +195,17 @@ class SpotifyService {
           'user-library-read'
         ],
         usePKCE: true,
-        redirectUri: process.env.SPOTIFY_REDIRECT_URI!,
+        redirectUri: SPOTIFY_REDIRECT_URI,
         responseType: AuthSession.ResponseType.Code,
         extraParams: {
           code_challenge_method: 'S256',
         },
       });
 
-      const codeVerifier = await Crypto.digestStringAsync(
-        Crypto.CryptoDigestAlgorithm.SHA256,
-        Math.random().toString(),
-        { encoding: Crypto.CryptoEncoding.HEX }
-      );
+      this.codeVerifier = this.generateCodeVerifier();
+      const codeChallenge = await this.generateCodeChallenge(this.codeVerifier);
 
-      request.codeChallenge = codeVerifier;
+      request.codeChallenge = codeChallenge;
 
       const result = await request.promptAsync({
         authorizationEndpoint: 'https://accounts.spotify.com/authorize',
@@ -211,9 +233,9 @@ class SpotifyService {
         body: new URLSearchParams({
           grant_type: 'authorization_code',
           code: code,
-          redirect_uri: process.env.SPOTIFY_REDIRECT_URI!,
-          client_id: process.env.SPOTIFY_CLIENT_ID!,
-          code_verifier: request.codeChallenge!,
+          redirect_uri: SPOTIFY_REDIRECT_URI,
+          client_id: SPOTIFY_CLIENT_ID,
+          code_verifier: this.codeVerifier!,
         }),
       });
 

@@ -36,4 +36,8 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
     'expo-secure-store'
   ],
   jsEngine: 'jsc',
+  extra: {
+    SPOTIFY_CLIENT_ID: process.env.SPOTIFY_CLIENT_ID,
+    SPOTIFY_REDIRECT_URI: process.env.SPOTIFY_REDIRECT_URI,
+  },
 }); 

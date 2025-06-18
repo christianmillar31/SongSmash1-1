@@ -36,15 +36,22 @@ If you cancel the authentication process, genre selection will be limited to pre
 2. Create a new app
 3. Get your `Client ID`
 4. **Important for PKCE Flow**: You do NOT need to store the Client Secret in your app. The PKCE flow is designed to work without it for mobile apps.
+5. **Configure Redirect URI**: In your Spotify app settings, add the redirect URI: `exp://localhost:8081/--/spotify-auth-callback`
 
 ### 3. Environment Configuration
 
 1. Copy your Spotify Client ID from the dashboard
-2. Update the `.env` file:
+2. Create a `.env` file in the project root:
+   ```bash
+   # Create the .env file
+   touch .env
+   ```
+3. Add the following content to your `.env` file:
    ```
    SPOTIFY_CLIENT_ID=your_spotify_client_id_here
    SPOTIFY_REDIRECT_URI=exp://localhost:8081/--/spotify-auth-callback
    ```
+4. Replace `your_spotify_client_id_here` with your actual Spotify Client ID
 
 ### 4. Installation
 
