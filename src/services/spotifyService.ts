@@ -301,30 +301,40 @@ class SpotifyService {
         if (attemptFilters.genres && attemptFilters.genres.length > 0) {
           console.log(`DEBUG: Using recommendations API for genres: ${attemptFilters.genres.join(', ')}`);
           
+          // Fetch available genre seeds from Spotify
+          const availableSeeds = await this.getAvailableGenres();
+          // Map user-selected genres to valid Spotify seeds (replace spaces with hyphens, lowercase)
+          const validSeeds = attemptFilters.genres
+            .map(g => g.toLowerCase().replace(/ /g, '-'))
+            .filter(g => availableSeeds.includes(g));
+          
+          if (validSeeds.length === 0) {
+            console.warn('No valid Spotify genre seeds found for selected genres:', attemptFilters.genres);
+          }
+          
           // Translate difficulty levels to popularity parameters
           let minPopularity = 0;
           let maxPopularity = 100;
           
           if (attemptFilters.difficulty && attemptFilters.difficulty.length > 0) {
             const difficulties = Array.isArray(attemptFilters.difficulty) ? attemptFilters.difficulty : [];
-            
             if (difficulties.includes('easy')) {
-              minPopularity = 70; // High popularity for easy tracks
+              minPopularity = 70;
               maxPopularity = 100;
             } else if (difficulties.includes('medium')) {
-              minPopularity = 40; // Medium popularity
+              minPopularity = 40;
               maxPopularity = 80;
             } else if (difficulties.includes('hard')) {
-              minPopularity = 0; // Low popularity for hard tracks
+              minPopularity = 0;
               maxPopularity = 50;
             } else if (difficulties.includes('expert')) {
-              minPopularity = 0; // Very low popularity for expert tracks
+              minPopularity = 0;
               maxPopularity = 30;
             }
           }
           
           // Build recommendations API URL
-          const seedGenres = attemptFilters.genres.slice(0, 5).join(','); // Max 5 seed genres
+          const seedGenres = validSeeds.slice(0, 5).map(encodeURIComponent).join(',');
           const recommendationsUrl = `https://api.spotify.com/v1/recommendations?seed_genres=${seedGenres}&min_popularity=${minPopularity}&max_popularity=${maxPopularity}&limit=100`;
           
           console.log(`DEBUG: Recommendations URL: ${recommendationsUrl}`);
@@ -339,12 +349,12 @@ class SpotifyService {
             const recommendationsData = await recommendationsResponse.json();
             const recommendedTracks = recommendationsData.tracks || [];
             console.log(`DEBUG: Tracks from recommendations API: ${recommendedTracks.length}`);
-            
             if (recommendedTracks.length > 0) {
               tracks = recommendedTracks;
             }
           } else {
-            console.error('Error fetching recommendations:', recommendationsResponse.status);
+            const errorText = await recommendationsResponse.text();
+            console.error('Error fetching recommendations:', recommendationsResponse.status, errorText);
           }
         }
 
