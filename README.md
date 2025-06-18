@@ -11,6 +11,16 @@ A React Native app built with Expo that creates a music trivia game using the Sp
 - **Game History**: Track all rounds and scores
 - **Modern UI**: Clean interface using React Native Paper
 
+## Authentication Requirements
+
+**Important**: Genre selection requires Spotify authentication. When you first access the Filters screen, the app will prompt you to log in to your Spotify account. This is necessary to:
+
+- Load the complete list of available genres from Spotify
+- Access personalized track recommendations
+- Ensure proper API access for track discovery
+
+If you cancel the authentication process, genre selection will be limited to predefined categories. You can retry authentication at any time using the "Retry Authentication" button in the Filters screen.
+
 ## Setup Instructions
 
 ### 1. Prerequisites
@@ -92,6 +102,18 @@ The app uses the Spotify Web API with OAuth PKCE flow:
 1. **"No tracks found"**: Try adjusting your filters or ensure you have a Spotify Premium account
 2. **Authentication fails**: Check your Client ID and ensure your Spotify app is properly configured
 3. **Audio doesn't play**: Some tracks may not have preview URLs available
+4. **Genres not loading**: 
+   - Ensure you complete the Spotify authentication process
+   - Check your internet connection
+   - Use the "Retry Authentication" button if authentication was cancelled
+   - Verify your Spotify app is properly configured in the developer dashboard
+
+### Authentication Issues
+
+- **"Spotify authentication required"**: Complete the login process when prompted
+- **"Authentication was cancelled"**: Use the retry button to attempt authentication again
+- **"Authentication failed"**: Check your internet connection and Spotify app configuration
+- **Limited genre selection**: This indicates authentication is needed - complete the login process
 
 ### Development Notes
 

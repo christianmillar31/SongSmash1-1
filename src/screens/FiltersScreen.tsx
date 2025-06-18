@@ -4,6 +4,7 @@ import {
   StyleSheet,
   ScrollView,
   Text,
+  Alert,
 } from 'react-native';
 import {
   Card,
@@ -11,6 +12,8 @@ import {
   Paragraph,
   Chip,
   Divider,
+  Button,
+  ActivityIndicator,
 } from 'react-native-paper';
 import { useGameStore } from '../store/gameStore';
 import { spotifyService } from '../services/spotifyService';
@@ -20,6 +23,8 @@ const FiltersScreen = () => {
 
   const [genres, setGenres] = useState<string[]>([]);
   const [loadingGenres, setLoadingGenres] = useState(true);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [isAuthenticating, setIsAuthenticating] = useState(false);
 
   const decades = [
     '1960s', '1970s', '1980s', '1990s', '2000s', '2010s', '2020s'
@@ -36,13 +41,51 @@ const FiltersScreen = () => {
     'World': ['reggae', 'latin', 'world', 'r&b', 'soul', 'metal']
   };
 
-  useEffect(() => {
-    const fetchGenres = async () => {
-      setLoadingGenres(true);
+  const fetchGenres = async () => {
+    setLoadingGenres(true);
+    setAuthError(null);
+    
+    try {
+      // Ensure authentication is completed before fetching genres
+      const isAuthenticated = await spotifyService.authenticate();
+      
+      if (!isAuthenticated) {
+        setAuthError('Spotify authentication required to load genres. Please try again.');
+        setLoadingGenres(false);
+        return;
+      }
+      
       const popularGenres = await spotifyService.getPopularGenres();
       setGenres(popularGenres);
+    } catch (error) {
+      console.error('Error fetching genres:', error);
+      setAuthError('Failed to load genres. Please check your internet connection and try again.');
+    } finally {
       setLoadingGenres(false);
-    };
+    }
+  };
+
+  const handleRetryAuthentication = async () => {
+    setIsAuthenticating(true);
+    setAuthError(null);
+    
+    try {
+      const isAuthenticated = await spotifyService.authenticate();
+      
+      if (isAuthenticated) {
+        await fetchGenres();
+      } else {
+        setAuthError('Authentication was cancelled. Genre selection requires Spotify login.');
+      }
+    } catch (error) {
+      console.error('Error during authentication retry:', error);
+      setAuthError('Authentication failed. Please try again.');
+    } finally {
+      setIsAuthenticating(false);
+    }
+  };
+
+  useEffect(() => {
     fetchGenres();
   }, []);
 
@@ -117,20 +160,39 @@ const FiltersScreen = () => {
             <Title style={styles.categoryTitle}>All Available Genres</Title>
             <View style={styles.chipContainer}>
               {loadingGenres ? (
-                <Paragraph>Loading genres...</Paragraph>
+                <View style={styles.loadingContainer}>
+                  <ActivityIndicator size="small" color="#1DB954" />
+                  <Paragraph style={styles.loadingText}>Loading genres...</Paragraph>
+                </View>
+              ) : authError ? (
+                <View style={styles.errorContainer}>
+                  <Paragraph style={styles.errorText}>{authError}</Paragraph>
+                  <Button
+                    mode="contained"
+                    onPress={handleRetryAuthentication}
+                    loading={isAuthenticating}
+                    disabled={isAuthenticating}
+                    style={styles.retryButton}
+                    icon="refresh"
+                  >
+                    {isAuthenticating ? 'Authenticating...' : 'Retry Authentication'}
+                  </Button>
+                </View>
               ) : genres.length === 0 ? (
                 <Paragraph>No genres available.</Paragraph>
-              ) : genres.map((genre) => (
-                <Chip
-                  key={genre}
-                  selected={filters.genres.includes(genre)}
-                  onPress={() => toggleGenre(genre)}
-                  style={getChipStyle(filters.genres.includes(genre))}
-                  textStyle={getChipTextStyle(filters.genres.includes(genre))}
-                >
-                  {genre}
-                </Chip>
-              ))}
+              ) : (
+                genres.map((genre) => (
+                  <Chip
+                    key={genre}
+                    selected={filters.genres.includes(genre)}
+                    onPress={() => toggleGenre(genre)}
+                    style={getChipStyle(filters.genres.includes(genre))}
+                    textStyle={getChipTextStyle(filters.genres.includes(genre))}
+                  >
+                    {genre}
+                  </Chip>
+                ))
+              )}
             </View>
           </Card.Content>
         </Card>
@@ -245,6 +307,29 @@ const styles = StyleSheet.create({
   },
   explanationText: {
     marginBottom: 8,
+  },
+  loadingContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 8,
+  },
+  loadingText: {
+    marginLeft: 8,
+    color: '#666',
+  },
+  errorContainer: {
+    flexDirection: 'column',
+    alignItems: 'center',
+    paddingVertical: 8,
+  },
+  errorText: {
+    marginBottom: 8,
+    color: '#d32f2f',
+    textAlign: 'center',
+  },
+  retryButton: {
+    marginTop: 8,
+    backgroundColor: '#1DB954',
   },
 });
 
