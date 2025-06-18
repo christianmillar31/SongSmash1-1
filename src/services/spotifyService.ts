@@ -57,9 +57,13 @@ class SpotifyService {
 
   // PKCE Helper Methods
   private generateCodeVerifier(): string {
-    const array = new Uint8Array(32);
-    crypto.getRandomValues(array);
-    return this.base64URLEncode(array);
+    // Use a pre-generated code verifier to avoid base64 encoding issues
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
+    let result = '';
+    for (let i = 0; i < 128; i++) {
+      result += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return result;
   }
 
   private async generateCodeChallenge(verifier: string): Promise<string> {
@@ -70,13 +74,6 @@ class SpotifyService {
     );
     // Convert base64 to base64url
     return hash.replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
-  }
-
-  private base64URLEncode(buffer: Uint8Array): string {
-    return btoa(String.fromCharCode(...buffer))
-      .replace(/\+/g, '-')
-      .replace(/\//g, '_')
-      .replace(/=/g, '');
   }
 
   private async loadTokensFromStorage(): Promise<void> {
@@ -197,9 +194,6 @@ class SpotifyService {
         usePKCE: true,
         redirectUri: SPOTIFY_REDIRECT_URI,
         responseType: AuthSession.ResponseType.Code,
-        extraParams: {
-          code_challenge_method: 'S256',
-        },
       });
 
       this.codeVerifier = this.generateCodeVerifier();
@@ -236,7 +230,7 @@ class SpotifyService {
           redirect_uri: SPOTIFY_REDIRECT_URI,
           client_id: SPOTIFY_CLIENT_ID,
           code_verifier: this.codeVerifier!,
-        }),
+        }).toString(),
       });
 
       if (response.ok) {
