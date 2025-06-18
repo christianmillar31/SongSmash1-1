@@ -138,83 +138,59 @@ class SpotifyService {
 
   // Enhanced genre filtering method inspired by the reference code
   private async getTrackGenres(track: any): Promise<string[]> {
-    const genres: Set<string> = new Set();
+    const genres: string[] = [];
+    
+    // Get genres from artists
+    if (track.artists && track.artists.length > 0) {
+      for (const artist of track.artists) {
+        if (this.artistGenresCache[artist.id]) {
+          genres.push(...this.artistGenresCache[artist.id]);
+        } else {
+          try {
+            const response = await fetch(`https://api.spotify.com/v1/artists/${artist.id}`, {
+              headers: {
+                'Authorization': `Bearer ${this.accessToken}`,
+              },
+            });
+            
+            if (response.ok) {
+              const artistData = await response.json();
+              const artistGenres = artistData.genres || [];
+              this.artistGenresCache[artist.id] = artistGenres;
+              genres.push(...artistGenres);
+            }
+          } catch (error) {
+            console.error('Error fetching artist genres:', error);
+          }
+        }
+      }
+    }
     
     // Get genres from album
-    if (track.album?.id && !this.albumGenresCache[track.album.id]) {
-      try {
-        const response = await fetch(`https://api.spotify.com/v1/albums/${track.album.id}`, {
-          headers: {
-            'Authorization': `Bearer ${this.accessToken}`,
-          },
-        });
-        if (response.ok) {
-          const albumData = await response.json();
-          this.albumGenresCache[track.album.id] = albumData.genres || [];
-        }
-      } catch (error) {
-        console.error('Error fetching album genres:', error);
-      }
-    }
-    
-    if (track.album?.id && this.albumGenresCache[track.album.id]) {
-      this.albumGenresCache[track.album.id].forEach((genre: string) => genres.add(genre));
-    }
-
-    // Get genres from artists
-    const artistIds = track.artists?.map((artist: any) => artist.id).filter(Boolean) || [];
-    const uncachedArtists = artistIds.filter((id: string) => !this.artistGenresCache[id]);
-    
-    if (uncachedArtists.length > 0) {
-      try {
-        const response = await fetch(`https://api.spotify.com/v1/artists?ids=${uncachedArtists.join(',')}`, {
-          headers: {
-            'Authorization': `Bearer ${this.accessToken}`,
-          },
-        });
-        if (response.ok) {
-          const artistsData = await response.json();
-          artistsData.artists.forEach((artist: any) => {
-            if (artist && artist.id) {
-              this.artistGenresCache[artist.id] = artist.genres || [];
-            }
+    if (track.album && track.album.id) {
+      if (this.albumGenresCache[track.album.id]) {
+        genres.push(...this.albumGenresCache[track.album.id]);
+      } else {
+        try {
+          const response = await fetch(`https://api.spotify.com/v1/albums/${track.album.id}`, {
+            headers: {
+              'Authorization': `Bearer ${this.accessToken}`,
+            },
           });
+          
+          if (response.ok) {
+            const albumData = await response.json();
+            const albumGenres = albumData.genres || [];
+            this.albumGenresCache[track.album.id] = albumGenres;
+            genres.push(...albumGenres);
+          }
+        } catch (error) {
+          console.error('Error fetching album genres:', error);
         }
-      } catch (error) {
-        console.error('Error fetching artist genres:', error);
       }
     }
     
-    artistIds.forEach((artistId: string) => {
-      if (this.artistGenresCache[artistId]) {
-        this.artistGenresCache[artistId].forEach((genre: string) => genres.add(genre));
-      }
-    });
-
-    return Array.from(genres);
-  }
-
-  // Enhanced genre filtering like the reference code
-  private async filterTracksByGenre(tracks: any[], selectedGenres: string[]): Promise<any[]> {
-    if (selectedGenres.length === 0) return tracks;
-    
-    const filteredTracks: any[] = [];
-    
-    for (const track of tracks) {
-      const trackGenres = await this.getTrackGenres(track);
-      const hasMatchingGenre = selectedGenres.some(selectedGenre => 
-        trackGenres.some(trackGenre => 
-          trackGenre.toLowerCase().includes(selectedGenre.toLowerCase()) ||
-          selectedGenre.toLowerCase().includes(trackGenre.toLowerCase())
-        )
-      );
-      
-      if (hasMatchingGenre) {
-        filteredTracks.push(track);
-      }
-    }
-    
-    return filteredTracks;
+    return [...new Set(genres)]; // Remove duplicates
   }
 
   async getRandomTrack(filters: {
@@ -321,7 +297,58 @@ class SpotifyService {
           }
         }
 
-        // Decade filtering (existing logic)
+        // Use Spotify's recommendations API for better genre-based track discovery
+        if (attemptFilters.genres && attemptFilters.genres.length > 0) {
+          console.log(`DEBUG: Using recommendations API for genres: ${attemptFilters.genres.join(', ')}`);
+          
+          // Translate difficulty levels to popularity parameters
+          let minPopularity = 0;
+          let maxPopularity = 100;
+          
+          if (attemptFilters.difficulty && attemptFilters.difficulty.length > 0) {
+            const difficulties = Array.isArray(attemptFilters.difficulty) ? attemptFilters.difficulty : [];
+            
+            if (difficulties.includes('easy')) {
+              minPopularity = 70; // High popularity for easy tracks
+              maxPopularity = 100;
+            } else if (difficulties.includes('medium')) {
+              minPopularity = 40; // Medium popularity
+              maxPopularity = 80;
+            } else if (difficulties.includes('hard')) {
+              minPopularity = 0; // Low popularity for hard tracks
+              maxPopularity = 50;
+            } else if (difficulties.includes('expert')) {
+              minPopularity = 0; // Very low popularity for expert tracks
+              maxPopularity = 30;
+            }
+          }
+          
+          // Build recommendations API URL
+          const seedGenres = attemptFilters.genres.slice(0, 5).join(','); // Max 5 seed genres
+          const recommendationsUrl = `https://api.spotify.com/v1/recommendations?seed_genres=${seedGenres}&min_popularity=${minPopularity}&max_popularity=${maxPopularity}&limit=100`;
+          
+          console.log(`DEBUG: Recommendations URL: ${recommendationsUrl}`);
+          
+          const recommendationsResponse = await fetch(recommendationsUrl, {
+            headers: {
+              'Authorization': `Bearer ${this.accessToken}`,
+            },
+          });
+          
+          if (recommendationsResponse.ok) {
+            const recommendationsData = await recommendationsResponse.json();
+            const recommendedTracks = recommendationsData.tracks || [];
+            console.log(`DEBUG: Tracks from recommendations API: ${recommendedTracks.length}`);
+            
+            if (recommendedTracks.length > 0) {
+              tracks = recommendedTracks;
+            }
+          } else {
+            console.error('Error fetching recommendations:', recommendationsResponse.status);
+          }
+        }
+
+        // Apply decade filtering to recommendations results
         if (attemptFilters.decades && attemptFilters.decades.length > 0 && tracks.length > 0) {
           const yearRanges = attemptFilters.decades.map((decade: string) => {
             switch (decade) {
@@ -344,73 +371,8 @@ class SpotifyService {
           console.log(`DEBUG: Tracks after decade filtering: ${tracks.length}`);
         }
 
-        // Simple genre filtering using Spotify's search
-        if (attemptFilters.genres && attemptFilters.genres.length > 0) {
-          console.log(`DEBUG: Attempting genre filtering for: ${attemptFilters.genres.join(', ')}`);
-          
-          // Try multiple genre search strategies
-          const genreStrategies = [
-            attemptFilters.genres.join(' '), // All genres together
-            attemptFilters.genres[0], // Just first genre
-            `genre:${attemptFilters.genres.join(' OR ')}` // Explicit genre search
-          ];
-          
-          for (const genreQuery of genreStrategies) {
-            const genreApiUrl = `https://api.spotify.com/v1/search?q=${encodeURIComponent(genreQuery)}&type=track&limit=50`;
-            console.log(`DEBUG: Trying genre search strategy: ${genreQuery}`);
-            
-            const genreResponse = await fetch(genreApiUrl, {
-              headers: {
-                'Authorization': `Bearer ${this.accessToken}`,
-              },
-            });
-            
-            if (genreResponse.ok) {
-              const genreData = await genreResponse.json();
-              const genreTracks = (genreData.tracks && genreData.tracks.items) ? genreData.tracks.items : [];
-              console.log(`DEBUG: Tracks from genre search "${genreQuery}": ${genreTracks.length}`);
-              
-              if (genreTracks.length > 0) {
-                // If we have decade filters, apply them to genre results
-                if (attemptFilters.decades && attemptFilters.decades.length > 0) {
-                  const yearRanges = attemptFilters.decades.map((decade: string) => {
-                    switch (decade) {
-                      case '1960s': return [1960, 1969];
-                      case '1970s': return [1970, 1979];
-                      case '1980s': return [1980, 1989];
-                      case '1990s': return [1990, 1999];
-                      case '2000s': return [2000, 2009];
-                      case '2010s': return [2010, 2019];
-                      case '2020s': return [2020, 2029];
-                      default: return null;
-                    }
-                  }).filter(Boolean) as [number, number][];
-                  
-                  const filteredGenreTracks = genreTracks.filter((track: any) => {
-                    if (!track.album || !track.album.release_date) return false;
-                    const year = parseInt(track.album.release_date.slice(0, 4));
-                    return yearRanges.some(([start, end]) => year >= start && year <= end);
-                  });
-                  
-                  console.log(`DEBUG: Genre tracks after decade filtering: ${filteredGenreTracks.length}`);
-                  tracks = filteredGenreTracks;
-                } else {
-                  tracks = genreTracks;
-                }
-                
-                // If we found tracks, break out of the strategy loop
-                if (tracks.length > 0) {
-                  console.log(`DEBUG: Successfully found ${tracks.length} tracks with genre strategy: ${genreQuery}`);
-                  break;
-                }
-              }
-            }
-          }
-        }
-
-        // Popularity-based difficulty filtering (existing logic)
-        const selectedDifficulties = Array.isArray(attemptFilters.difficulty) ? attemptFilters.difficulty : [];
-        if (selectedDifficulties.length > 0 && tracks.length > 0) {
+        // If no difficulty was specified in recommendations, apply popularity-based filtering
+        if ((!attemptFilters.difficulty || attemptFilters.difficulty.length === 0) && tracks.length > 0) {
           // Compute popularity percentiles like the reference code
           const pops = tracks.map((t: any) => t.popularity || 0).sort((a: number, b: number) => a - b);
           const percentile = (arr: number[], p: number) => {
@@ -429,19 +391,8 @@ class SpotifyService {
           console.log(`DEBUG: Popularity percentiles: easyCut=${easyCut}, hardCut=${hardCut}`);
           console.log(`DEBUG: easyTracks=${easyTracks.length}, mediumTracks=${mediumTracks.length}, hardTracks=${hardTracks.length}`);
           
-          let filtered: any[] = [];
-          if (selectedDifficulties.includes('easy')) filtered = filtered.concat(easyTracks);
-          if (selectedDifficulties.includes('medium')) filtered = filtered.concat(mediumTracks);
-          if (selectedDifficulties.includes('hard')) filtered = filtered.concat(hardTracks);
-          if (selectedDifficulties.includes('expert')) filtered = filtered.concat(hardTracks); // Expert = hard
-          
-          // Remove duplicates
-          tracks = Array.from(new Set(filtered));
-          console.log(`DEBUG: Tracks after difficulty filtering: ${tracks.length}`);
-          
-          if (tracks.length > 0 && tracks.length < 5) {
-            console.warn(`Only ${tracks.length} tracks match your filters. Consider relaxing difficulty or decade.`);
-          }
+          // Use all tracks if no specific difficulty was requested
+          tracks = tracks;
         }
 
         // Prioritize tracks with preview URLs for in-app playback
@@ -472,36 +423,6 @@ class SpotifyService {
       console.error('Error fetching track:', error);
       return null;
     }
-  }
-
-  private buildSearchQuery(filters: {
-    genres?: string[];
-    decades?: string[];
-    difficulty?: string[];
-  }): string {
-    // Simplified query to get more tracks for better filtering
-    let query = 'track:*'; // This will match any track
-
-    if (filters.decades && filters.decades.length > 0) {
-      const yearRanges = filters.decades.map(decade => {
-        switch (decade) {
-          case '1960s': return 'year:1960-1969';
-          case '1970s': return 'year:1970-1979';
-          case '1980s': return 'year:1980-1989';
-          case '1990s': return 'year:1990-1999';
-          case '2000s': return 'year:2000-2009';
-          case '2010s': return 'year:2010-2019';
-          case '2020s': return 'year:2020-2029';
-          default: return '';
-        }
-      }).filter(Boolean);
-      
-      if (yearRanges.length > 0) {
-        query += ` (${yearRanges.join(' OR ')})`;
-      }
-    }
-
-    return query;
   }
 
   isAuthenticated(): boolean {
