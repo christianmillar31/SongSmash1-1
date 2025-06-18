@@ -88,9 +88,9 @@ const GameScreen = () => {
     setScores({});
     
     try {
-      // Play the first 30 seconds of the track using Spotify's preview URL
+      // Check if track has a preview URL (30 seconds)
       if (track.preview_url) {
-        console.log('Playing first 30 seconds of track in app');
+        console.log('Playing 30-second preview in app');
         const { sound: newSound } = await Audio.Sound.createAsync(
           { uri: track.preview_url },
           { shouldPlay: true, positionMillis: 0 }
@@ -106,15 +106,36 @@ const GameScreen = () => {
           }
         });
       } else {
-        Alert.alert(
-          'No Preview Available', 
-          'This track does not have a 30-second preview available. Please try another track.',
-          [{ text: 'OK' }]
-        );
+        // No preview URL - open full track in Spotify from beginning
+        console.log('Opening full track in Spotify from beginning');
+        if (track.external_urls?.spotify) {
+          Alert.alert(
+            'Full Track in Spotify', 
+            'Opening the full track in Spotify from the beginning. Listen to the song, then return here to score!',
+            [
+              { text: 'Cancel', style: 'cancel' },
+              { 
+                text: 'Open Spotify', 
+                onPress: () => {
+                  Linking.openURL(track.external_urls.spotify);
+                  // Allow scoring after a delay
+                  setTimeout(() => {
+                    setIsPlaying(false);
+                    setShowScores(true);
+                  }, 30000); // 30 seconds
+                }
+              }
+            ]
+          );
+        } else {
+          Alert.alert('Track Unavailable', 'This track is not available for playback.');
+          setShowScores(true);
+        }
       }
     } catch (error) {
       console.error('Error playing track:', error);
-      Alert.alert('Playback Error', 'Could not play the track. Please try another track.');
+      Alert.alert('Playback Error', 'Could not play the track. You can still score manually.');
+      setShowScores(true);
     }
   };
 
@@ -238,8 +259,8 @@ const GameScreen = () => {
                     <Title>🎵 Now Playing</Title>
                     <Paragraph>
                       {currentTrack.preview_url 
-                        ? 'Listen to the first 30 seconds and guess the song!'
-                        : 'This track has no preview available for in-app playback.'
+                        ? 'Listen to the 30-second preview and guess the song!'
+                        : 'Opening full track in Spotify from the beginning. Listen and return here to score!'
                       }
                     </Paragraph>
                     
@@ -290,14 +311,14 @@ const GameScreen = () => {
                 </View>
               )}
 
-              {isPlaying && (
+              {isPlaying && currentTrack.preview_url && (
                 <View style={styles.controls}>
                   <Button
                     mode="outlined"
                     onPress={stopTrack}
                     icon="stop"
                   >
-                    Stop Track
+                    Stop Preview
                   </Button>
                 </View>
               )}

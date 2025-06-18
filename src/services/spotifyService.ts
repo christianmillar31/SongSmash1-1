@@ -1,5 +1,6 @@
 import * as AuthSession from 'expo-auth-session';
 import * as Crypto from 'expo-crypto';
+import * as SecureStore from 'expo-secure-store';
 import { SPOTIFY_CLIENT_ID, SPOTIFY_REDIRECT_URI } from '@env';
 
 // Debug logging for environment variables
@@ -40,24 +41,153 @@ export interface SpotifyPlaylist {
 class SpotifyService {
   private accessToken: string | null = null;
   private refreshToken: string | null = null;
+  private tokenExpiry: number | null = null;
   private artistGenresCache: Record<string, string[]> = {};
   private albumGenresCache: Record<string, string[]> = {};
 
-  async authenticate(): Promise<boolean> {
+  // Secure storage keys
+  private readonly ACCESS_TOKEN_KEY = 'spotify_access_token';
+  private readonly REFRESH_TOKEN_KEY = 'spotify_refresh_token';
+  private readonly TOKEN_EXPIRY_KEY = 'spotify_token_expiry';
+
+  constructor() {
+    this.loadTokensFromStorage();
+  }
+
+  private async loadTokensFromStorage(): Promise<void> {
     try {
-      // Use AuthSession.AuthRequest to handle PKCE automatically
-      const request = new AuthSession.AuthRequest({
-        clientId: SPOTIFY_CLIENT_ID!,
-        scopes: SPOTIFY_SCOPES,
-        redirectUri: SPOTIFY_REDIRECT_URI!,
-        responseType: AuthSession.ResponseType.Code,
-        codeChallengeMethod: AuthSession.CodeChallengeMethod.S256,
+      const [accessToken, refreshToken, expiryStr] = await Promise.all([
+        SecureStore.getItemAsync(this.ACCESS_TOKEN_KEY),
+        SecureStore.getItemAsync(this.REFRESH_TOKEN_KEY),
+        SecureStore.getItemAsync(this.TOKEN_EXPIRY_KEY),
+      ]);
+
+      if (accessToken && refreshToken && expiryStr) {
+        this.accessToken = accessToken;
+        this.refreshToken = refreshToken;
+        this.tokenExpiry = parseInt(expiryStr, 10);
+
+        // Check if token is expired and refresh if needed
+        if (this.isTokenExpired()) {
+          await this.refreshAccessToken();
+        }
+      }
+    } catch (error) {
+      console.error('Error loading tokens from storage:', error);
+    }
+  }
+
+  private async saveTokensToStorage(): Promise<void> {
+    try {
+      await Promise.all([
+        SecureStore.setItemAsync(this.ACCESS_TOKEN_KEY, this.accessToken || ''),
+        SecureStore.setItemAsync(this.REFRESH_TOKEN_KEY, this.refreshToken || ''),
+        SecureStore.setItemAsync(this.TOKEN_EXPIRY_KEY, this.tokenExpiry?.toString() || ''),
+      ]);
+    } catch (error) {
+      console.error('Error saving tokens to storage:', error);
+    }
+  }
+
+  private async clearTokensFromStorage(): Promise<void> {
+    try {
+      await Promise.all([
+        SecureStore.deleteItemAsync(this.ACCESS_TOKEN_KEY),
+        SecureStore.deleteItemAsync(this.REFRESH_TOKEN_KEY),
+        SecureStore.deleteItemAsync(this.TOKEN_EXPIRY_KEY),
+      ]);
+    } catch (error) {
+      console.error('Error clearing tokens from storage:', error);
+    }
+  }
+
+  private isTokenExpired(): boolean {
+    if (!this.tokenExpiry) return true;
+    // Add 5 minute buffer to refresh before actual expiry
+    return Date.now() >= (this.tokenExpiry - 5 * 60 * 1000);
+  }
+
+  private async refreshAccessToken(): Promise<boolean> {
+    if (!this.refreshToken) return false;
+
+    try {
+      const response = await fetch('https://accounts.spotify.com/api/token', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: this.refreshToken,
+          client_id: process.env.SPOTIFY_CLIENT_ID!,
+        }),
       });
 
-      // Debug: print the full Spotify Auth URL
-      console.log('DEBUG: Full Spotify Auth URL', request.url);
+      if (response.ok) {
+        const data = await response.json();
+        this.accessToken = data.access_token;
+        this.tokenExpiry = Date.now() + (data.expires_in * 1000);
+        
+        // Update refresh token if a new one is provided
+        if (data.refresh_token) {
+          this.refreshToken = data.refresh_token;
+        }
+        
+        await this.saveTokensToStorage();
+        return true;
+      } else {
+        console.error('Failed to refresh token:', response.status);
+        await this.clearTokensFromStorage();
+        return false;
+      }
+    } catch (error) {
+      console.error('Error refreshing token:', error);
+      await this.clearTokensFromStorage();
+      return false;
+    }
+  }
 
-      const result = await request.promptAsync(SPOTIFY_DISCOVERY);
+  async authenticate(): Promise<boolean> {
+    // Check if we already have a valid token
+    if (this.accessToken && !this.isTokenExpired()) {
+      return true;
+    }
+
+    // Try to refresh the token if we have a refresh token
+    if (this.refreshToken && await this.refreshAccessToken()) {
+      return true;
+    }
+
+    // If no valid token and no refresh token, perform full authentication
+    try {
+      const request = new AuthSession.AuthRequest({
+        clientId: process.env.SPOTIFY_CLIENT_ID!,
+        scopes: [
+          'user-read-private',
+          'user-read-email',
+          'playlist-read-private',
+          'playlist-read-collaborative',
+          'user-library-read'
+        ],
+        usePKCE: true,
+        redirectUri: process.env.SPOTIFY_REDIRECT_URI!,
+        responseType: AuthSession.ResponseType.Code,
+        extraParams: {
+          code_challenge_method: 'S256',
+        },
+      });
+
+      const codeVerifier = await Crypto.digestStringAsync(
+        Crypto.CryptoDigestAlgorithm.SHA256,
+        Math.random().toString(),
+        { encoding: Crypto.CryptoEncoding.HEX }
+      );
+
+      request.codeChallenge = codeVerifier;
+
+      const result = await request.promptAsync({
+        authorizationEndpoint: 'https://accounts.spotify.com/authorize',
+      });
 
       if (result.type === 'success' && result.params.code) {
         await this.exchangeCodeForTokens(request, result.params.code);
@@ -73,37 +203,38 @@ class SpotifyService {
 
   private async exchangeCodeForTokens(request: AuthSession.AuthRequest, code: string): Promise<void> {
     try {
-      if (!request.codeVerifier) {
-        throw new Error('Code verifier not found on AuthRequest');
-      }
-
-      const body = [
-        `grant_type=authorization_code`,
-        `code=${encodeURIComponent(code)}`,
-        `redirect_uri=${encodeURIComponent(SPOTIFY_REDIRECT_URI!)}`,
-        `client_id=${encodeURIComponent(SPOTIFY_CLIENT_ID!)}`,
-        `code_verifier=${encodeURIComponent(request.codeVerifier)}`,
-      ].join('&');
-
-      const tokenResponse = await fetch('https://accounts.spotify.com/api/token', {
+      const response = await fetch('https://accounts.spotify.com/api/token', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
         },
-        body,
+        body: new URLSearchParams({
+          grant_type: 'authorization_code',
+          code: code,
+          redirect_uri: process.env.SPOTIFY_REDIRECT_URI!,
+          client_id: process.env.SPOTIFY_CLIENT_ID!,
+          code_verifier: request.codeChallenge!,
+        }),
       });
 
-      const tokenData = await tokenResponse.json();
-      console.log('DEBUG: Token exchange response:', JSON.stringify(tokenData, null, 2));
-      if (tokenData.access_token) {
-        this.accessToken = tokenData.access_token ?? null;
-        this.refreshToken = tokenData.refresh_token ?? null;
-        console.log('DEBUG: Successfully obtained access token');
+      if (response.ok) {
+        const data = await response.json();
+        this.accessToken = data.access_token;
+        this.refreshToken = data.refresh_token;
+        this.tokenExpiry = Date.now() + (data.expires_in * 1000);
+        
+        // Save tokens to secure storage
+        await this.saveTokensToStorage();
+        
+        console.log('Successfully authenticated with Spotify');
       } else {
-        console.error('DEBUG: No access token in response:', tokenData);
+        const errorText = await response.text();
+        console.error('Failed to exchange code for tokens:', response.status, errorText);
+        throw new Error(`Token exchange failed: ${response.status}`);
       }
     } catch (error) {
-      console.error('Token exchange error:', error);
+      console.error('Error exchanging code for tokens:', error);
+      throw error;
     }
   }
 
@@ -199,9 +330,10 @@ class SpotifyService {
     difficulty?: string[];
     relaxFilters?: boolean;
   }): Promise<SpotifyTrack | { noTracks: true; attemptedFilters: any } | null> {
-    if (!this.accessToken) {
-      const authenticated = await this.authenticate();
-      if (!authenticated) return null;
+    const hasValidToken = await this.ensureValidToken();
+    if (!hasValidToken) {
+      console.error('No valid token available for API call');
+      return null;
     }
 
     try {
@@ -217,87 +349,9 @@ class SpotifyService {
       
       for (let i = 0; i < searchAttempts.length; i++) {
         const attemptFilters = searchAttempts[i];
-        
-        // Build search query based on decades
-        let searchQuery = 'track:*'; // Default to all tracks
-        if (attemptFilters.decades && attemptFilters.decades.length > 0) {
-          const yearRanges = attemptFilters.decades.map((decade: string) => {
-            switch (decade) {
-              case '1960s': return 'year:1960-1969';
-              case '1970s': return 'year:1970-1979';
-              case '1980s': return 'year:1980-1989';
-              case '1990s': return 'year:1990-1999';
-              case '2000s': return 'year:2000-2009';
-              case '2010s': return 'year:2010-2019';
-              case '2020s': return 'year:2020-2029';
-              default: return '';
-            }
-          }).filter(Boolean);
-          
-          if (yearRanges.length > 0) {
-            searchQuery = yearRanges.join(' OR ');
-          }
-        }
-        
-        const apiUrl = `https://api.spotify.com/v1/search?q=${encodeURIComponent(searchQuery)}&type=track&limit=50`;
-        
-        console.log(`DEBUG: Spotify search attempt ${i + 1}:`, searchQuery);
-        let response = await fetch(apiUrl, {
-          headers: {
-            'Authorization': `Bearer ${this.accessToken}`,
-          },
-        });
-        
-        if (response.status === 401) {
-          console.log('DEBUG: Access token invalid, re-authenticating...');
-          const authenticated = await this.authenticate();
-          if (!authenticated) return null;
-          response = await fetch(apiUrl, {
-            headers: {
-              'Authorization': `Bearer ${this.accessToken}`,
-            },
-          });
-        }
-        
-        const data = await response.json();
-        let tracks = (data.tracks && data.tracks.items) ? data.tracks.items : [];
-        console.log(`DEBUG: Initial tracks found: ${tracks.length}`);
+        let tracks: any[] = [];
 
-        // If no tracks found, try a broader search
-        if (tracks.length === 0) {
-          console.log(`DEBUG: No tracks found with "${searchQuery}", trying broader search`);
-          const broaderApiUrl = `https://api.spotify.com/v1/search?q=track:*&type=track&limit=50`;
-          const broaderResponse = await fetch(broaderApiUrl, {
-            headers: {
-              'Authorization': `Bearer ${this.accessToken}`,
-            },
-          });
-          
-          if (broaderResponse.ok) {
-            const broaderData = await broaderResponse.json();
-            tracks = (broaderData.tracks && broaderData.tracks.items) ? broaderData.tracks.items : [];
-            console.log(`DEBUG: Broader search found: ${tracks.length} tracks`);
-          }
-        }
-
-        // If still no tracks, try recommendations API
-        if (tracks.length === 0) {
-          console.log(`DEBUG: Still no tracks, trying recommendations API`);
-          const recommendationsUrl = `https://api.spotify.com/v1/recommendations?limit=50&seed_genres=pop&min_popularity=50`;
-          const recommendationsResponse = await fetch(recommendationsUrl, {
-            headers: {
-              'Authorization': `Bearer ${this.accessToken}`,
-            },
-          });
-          
-          if (recommendationsResponse.ok) {
-            const recommendationsData = await recommendationsResponse.json();
-            tracks = recommendationsData.tracks || [];
-            console.log(`DEBUG: Recommendations API found: ${tracks.length} tracks`);
-          }
-        }
-
-        // Use Spotify's recommendations API for better genre-based track discovery
+        // Use Spotify's recommendations API for track discovery
         if (attemptFilters.genres && attemptFilters.genres.length > 0) {
           console.log(`DEBUG: Using recommendations API for genres: ${attemptFilters.genres.join(', ')}`);
           
@@ -310,6 +364,7 @@ class SpotifyService {
           
           if (validSeeds.length === 0) {
             console.warn('No valid Spotify genre seeds found for selected genres:', attemptFilters.genres);
+            continue; // Try next search attempt
           }
           
           // Translate difficulty levels to popularity parameters
@@ -347,18 +402,33 @@ class SpotifyService {
           
           if (recommendationsResponse.ok) {
             const recommendationsData = await recommendationsResponse.json();
-            const recommendedTracks = recommendationsData.tracks || [];
-            console.log(`DEBUG: Tracks from recommendations API: ${recommendedTracks.length}`);
-            if (recommendedTracks.length > 0) {
-              tracks = recommendedTracks;
-            }
+            tracks = recommendationsData.tracks || [];
+            console.log(`DEBUG: Tracks from recommendations API: ${tracks.length}`);
           } else {
             const errorText = await recommendationsResponse.text();
             console.error('Error fetching recommendations:', recommendationsResponse.status, errorText);
+            continue; // Try next search attempt
+          }
+        } else {
+          // Fallback: use search API for broader results
+          console.log(`DEBUG: Using search API as fallback`);
+          const searchQuery = 'track:*';
+          const apiUrl = `https://api.spotify.com/v1/search?q=${encodeURIComponent(searchQuery)}&type=track&limit=50`;
+          
+          const response = await fetch(apiUrl, {
+            headers: {
+              'Authorization': `Bearer ${this.accessToken}`,
+            },
+          });
+          
+          if (response.ok) {
+            const data = await response.json();
+            tracks = (data.tracks && data.tracks.items) ? data.tracks.items : [];
+            console.log(`DEBUG: Tracks from search API: ${tracks.length}`);
           }
         }
 
-        // Apply decade filtering to recommendations results
+        // Apply decade filtering
         if (attemptFilters.decades && attemptFilters.decades.length > 0 && tracks.length > 0) {
           const yearRanges = attemptFilters.decades.map((decade: string) => {
             switch (decade) {
@@ -381,9 +451,9 @@ class SpotifyService {
           console.log(`DEBUG: Tracks after decade filtering: ${tracks.length}`);
         }
 
-        // If no difficulty was specified in recommendations, apply popularity-based filtering
+        // Apply difficulty filtering if not already applied in recommendations
         if ((!attemptFilters.difficulty || attemptFilters.difficulty.length === 0) && tracks.length > 0) {
-          // Compute popularity percentiles like the reference code
+          // Compute popularity percentiles for difficulty-based filtering
           const pops = tracks.map((t: any) => t.popularity || 0).sort((a: number, b: number) => a - b);
           const percentile = (arr: number[], p: number) => {
             if (arr.length === 0) return 0;
@@ -391,36 +461,13 @@ class SpotifyService {
             return arr[Math.min(idx, arr.length - 1)];
           };
           
-          const easyCut = percentile(pops, 75); // Top 25% most popular
-          const hardCut = percentile(pops, 25); // Bottom 25% least popular
-          
-          const easyTracks = tracks.filter((t: any) => t.popularity >= easyCut);
-          const hardTracks = tracks.filter((t: any) => t.popularity <= hardCut);
-          const mediumTracks = tracks.filter((t: any) => t.popularity > hardCut && t.popularity < easyCut);
+          const easyCut = percentile(pops, 75);
+          const hardCut = percentile(pops, 25);
           
           console.log(`DEBUG: Popularity percentiles: easyCut=${easyCut}, hardCut=${hardCut}`);
-          console.log(`DEBUG: easyTracks=${easyTracks.length}, mediumTracks=${mediumTracks.length}, hardTracks=${hardTracks.length}`);
-          
-          // Use all tracks if no specific difficulty was requested
-          tracks = tracks;
         }
 
-        // Prioritize tracks with preview URLs for in-app playback
-        const tracksWithPreview = tracks.filter((track: any) => !!track.preview_url);
-        const tracksWithoutPreview = tracks.filter((track: any) => !track.preview_url);
-        
-        console.log(`DEBUG: Tracks with preview: ${tracksWithPreview.length}`);
-        console.log(`DEBUG: Tracks without preview: ${tracksWithoutPreview.length}`);
-        
-        // For in-app playback, we need tracks with preview URLs
-        if (tracksWithPreview.length > 0) {
-          tracks = tracksWithPreview;
-          console.log(`DEBUG: Using tracks with preview URLs for in-app playback: ${tracks.length}`);
-        } else {
-          tracks = [];
-          console.log(`DEBUG: No tracks with preview URLs found for in-app playback`);
-        }
-
+        // Return a random track if we have any
         if (tracks.length > 0) {
           const randomIndex = Math.floor(Math.random() * tracks.length);
           return tracks[randomIndex];
@@ -444,36 +491,27 @@ class SpotifyService {
   }
 
   async getAvailableGenres(): Promise<string[]> {
-    if (!this.accessToken) {
-      const authenticated = await this.authenticate();
-      if (!authenticated) return [];
+    const hasValidToken = await this.ensureValidToken();
+    if (!hasValidToken) {
+      console.error('No valid token available for API call');
+      return [];
     }
+
     try {
-      let response = await fetch('https://api.spotify.com/v1/recommendations/available-genre-seeds', {
+      const response = await fetch('https://api.spotify.com/v1/recommendations/available-genre-seeds', {
         headers: {
           'Authorization': `Bearer ${this.accessToken}`,
         },
       });
-      if (response.status === 401) {
-        // Token expired, re-authenticate and retry
-        const authenticated = await this.authenticate();
-        if (!authenticated) return [];
-        response = await fetch('https://api.spotify.com/v1/recommendations/available-genre-seeds', {
-          headers: {
-            'Authorization': `Bearer ${this.accessToken}`,
-          },
-        });
-      }
+
       if (!response.ok) {
         const text = await response.text();
         console.error('Error fetching available genres, status:', response.status, text);
         return [];
       }
+
       const data = await response.json();
-      if (data.genres) {
-        return data.genres;
-      }
-      return [];
+      return data.genres || [];
     } catch (error) {
       console.error('Error fetching available genres:', error);
       return [];
@@ -520,6 +558,21 @@ class SpotifyService {
   // Check if a track has a preview URL
   static hasPreviewUrl(track: SpotifyTrack): boolean {
     return !!track.preview_url;
+  }
+
+  private async ensureValidToken(): Promise<boolean> {
+    // If we have a valid token, return true
+    if (this.accessToken && !this.isTokenExpired()) {
+      return true;
+    }
+
+    // If we have a refresh token, try to refresh
+    if (this.refreshToken && await this.refreshAccessToken()) {
+      return true;
+    }
+
+    // If no valid token and refresh failed, authenticate
+    return await this.authenticate();
   }
 }
 

@@ -8,6 +8,11 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
   orientation: 'portrait',
   icon: './assets/icon.png',
   userInterfaceStyle: 'light',
+  splash: {
+    image: './assets/splash-icon.png',
+    resizeMode: 'contain',
+    backgroundColor: '#ffffff'
+  },
   assetBundlePatterns: [
     '**/*'
   ],
@@ -27,7 +32,8 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
   },
   scheme: 'songsmash',
   plugins: [
-    'expo-audio'
+    'expo-audio',
+    'expo-secure-store'
   ],
   jsEngine: 'jsc',
 }); 
