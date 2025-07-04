@@ -1,4 +1,5 @@
 import * as AuthSession from 'expo-auth-session';
+import { CodeChallengeMethod } from 'expo-auth-session';
 import * as Crypto from 'expo-crypto';
 import * as SecureStore from 'expo-secure-store';
 import { SPOTIFY_CLIENT_ID, SPOTIFY_REDIRECT_URI } from '@env';
@@ -50,6 +51,14 @@ class SpotifyService {
   private readonly ACCESS_TOKEN_KEY = 'spotify_access_token';
   private readonly REFRESH_TOKEN_KEY = 'spotify_refresh_token';
   private readonly TOKEN_EXPIRY_KEY = 'spotify_token_expiry';
+  
+  // Difficulty popularity ranges for filtering
+  private readonly DIFFICULTY_RANGES: Record<string, [number, number]> = {
+    'easy': [70, 100],
+    'medium': [40, 80],
+    'hard': [0, 50],
+    'expert': [0, 30]
+  };
 
   constructor() {
     this.loadTokensFromStorage();
@@ -142,7 +151,7 @@ class SpotifyService {
           grant_type: 'refresh_token',
           refresh_token: this.refreshToken,
           client_id: SPOTIFY_CLIENT_ID,
-        }),
+        }).toString(),
       });
 
       if (response.ok) {
@@ -182,6 +191,10 @@ class SpotifyService {
 
     // If no valid token and no refresh token, perform full authentication
     try {
+      this.codeVerifier = this.generateCodeVerifier();
+      await SecureStore.setItemAsync('spotify_code_verifier', this.codeVerifier);
+      const codeChallenge = await this.generateCodeChallenge(this.codeVerifier);
+
       const request = new AuthSession.AuthRequest({
         clientId: SPOTIFY_CLIENT_ID,
         scopes: [
@@ -194,12 +207,10 @@ class SpotifyService {
         usePKCE: true,
         redirectUri: SPOTIFY_REDIRECT_URI,
         responseType: AuthSession.ResponseType.Code,
+        codeChallenge,
+        codeChallengeMethod: CodeChallengeMethod.S256,
+        // codeVerifier is not a valid property here
       });
-
-      this.codeVerifier = this.generateCodeVerifier();
-      const codeChallenge = await this.generateCodeChallenge(this.codeVerifier);
-
-      request.codeChallenge = codeChallenge;
 
       const result = await request.promptAsync({
         authorizationEndpoint: 'https://accounts.spotify.com/authorize',
@@ -219,6 +230,8 @@ class SpotifyService {
 
   private async exchangeCodeForTokens(request: AuthSession.AuthRequest, code: string): Promise<void> {
     try {
+      // Retrieve the code verifier from SecureStore
+      this.codeVerifier = await SecureStore.getItemAsync('spotify_code_verifier');
       const response = await fetch('https://accounts.spotify.com/api/token', {
         method: 'POST',
         headers: {
@@ -337,7 +350,7 @@ class SpotifyService {
       }
     }
     
-    return [...new Set(genres)]; // Remove duplicates
+    return Array.from(new Set(genres)); // Remove duplicates and return as string[]
   }
 
   async getRandomTrack(filters: {
@@ -389,18 +402,18 @@ class SpotifyService {
           
           if (attemptFilters.difficulty && attemptFilters.difficulty.length > 0) {
             const difficulties = Array.isArray(attemptFilters.difficulty) ? attemptFilters.difficulty : [];
-            if (difficulties.includes('easy')) {
-              minPopularity = 70;
-              maxPopularity = 100;
-            } else if (difficulties.includes('medium')) {
-              minPopularity = 40;
-              maxPopularity = 80;
-            } else if (difficulties.includes('hard')) {
-              minPopularity = 0;
-              maxPopularity = 50;
-            } else if (difficulties.includes('expert')) {
-              minPopularity = 0;
-              maxPopularity = 30;
+            
+            // Collect all ranges for selected difficulties
+            const selectedRanges = difficulties
+              .filter(difficulty => this.DIFFICULTY_RANGES[difficulty])
+              .map(difficulty => this.DIFFICULTY_RANGES[difficulty]);
+            
+            if (selectedRanges.length > 0) {
+              // Merge all ranges to compute final min/max popularity
+              minPopularity = Math.min(...selectedRanges.map(range => range[0]));
+              maxPopularity = Math.max(...selectedRanges.map(range => range[1]));
+              
+              console.log(`DEBUG: Combined difficulty ranges for [${difficulties.join(', ')}]: min=${minPopularity}, max=${maxPopularity}`);
             }
           }
           
@@ -467,20 +480,92 @@ class SpotifyService {
           console.log(`DEBUG: Tracks after decade filtering: ${tracks.length}`);
         }
 
-        // Apply difficulty filtering if not already applied in recommendations
-        if ((!attemptFilters.difficulty || attemptFilters.difficulty.length === 0) && tracks.length > 0) {
-          // Compute popularity percentiles for difficulty-based filtering
-          const pops = tracks.map((t: any) => t.popularity || 0).sort((a: number, b: number) => a - b);
-          const percentile = (arr: number[], p: number) => {
-            if (arr.length === 0) return 0;
-            const idx = Math.floor((p / 100) * arr.length);
-            return arr[Math.min(idx, arr.length - 1)];
-          };
+        // Apply detailed genre filtering using getTrackGenres
+        if (attemptFilters.genres && attemptFilters.genres.length > 0 && tracks.length > 0) {
+          console.log(`DEBUG: Applying detailed genre filtering for ${tracks.length} tracks`);
           
-          const easyCut = percentile(pops, 75);
-          const hardCut = percentile(pops, 25);
+          // Normalize user-selected genres for comparison
+          const normalizedUserGenres = attemptFilters.genres.map(g => g.toLowerCase().trim());
           
-          console.log(`DEBUG: Popularity percentiles: easyCut=${easyCut}, hardCut=${hardCut}`);
+          // Filter tracks based on their actual genres
+          const genreFilteredTracks: any[] = [];
+          
+          // Process tracks in smaller batches to avoid overwhelming the API
+          const batchSize = 10;
+          for (let i = 0; i < tracks.length; i += batchSize) {
+            const batch = tracks.slice(i, i + batchSize);
+            const batchPromises = batch.map(async (track) => {
+              try {
+                const trackGenres = await this.getTrackGenres(track);
+                const normalizedTrackGenres = trackGenres.map(g => g.toLowerCase().trim());
+                
+                // Check if any of the track's genres match any of the user's selected genres
+                const hasMatchingGenre = normalizedTrackGenres.some(trackGenre => 
+                  normalizedUserGenres.some(userGenre => 
+                    trackGenre.includes(userGenre) || userGenre.includes(trackGenre)
+                  )
+                );
+                
+                return hasMatchingGenre ? track : null;
+              } catch (error) {
+                console.error('Error getting track genres for filtering:', error);
+                // If we can't get genres for a track, include it to avoid losing too many tracks
+                return track;
+              }
+            });
+            
+            const batchResults = await Promise.all(batchPromises);
+            genreFilteredTracks.push(...batchResults.filter(track => track !== null));
+          }
+          
+          tracks = genreFilteredTracks;
+          console.log(`DEBUG: Tracks after detailed genre filtering: ${tracks.length}`);
+        }
+
+        // Apply difficulty filtering
+        if (tracks.length > 0) {
+          let minPopularity = 0;
+          let maxPopularity = 100;
+          
+          if (attemptFilters.difficulty && attemptFilters.difficulty.length > 0) {
+            // Use the same logic as recommendations API for selected difficulties
+            const difficulties = Array.isArray(attemptFilters.difficulty) ? attemptFilters.difficulty : [];
+            const selectedRanges = difficulties
+              .filter(difficulty => this.DIFFICULTY_RANGES[difficulty])
+              .map(difficulty => this.DIFFICULTY_RANGES[difficulty]);
+            
+            if (selectedRanges.length > 0) {
+              minPopularity = Math.min(...selectedRanges.map(range => range[0]));
+              maxPopularity = Math.max(...selectedRanges.map(range => range[1]));
+              console.log(`DEBUG: Using fixed difficulty ranges for [${difficulties.join(', ')}]: min=${minPopularity}, max=${maxPopularity}`);
+            }
+          } else {
+            // No specific difficulties selected - use percentile-based filtering
+            const pops = tracks.map((t: any) => t.popularity || 0).sort((a: number, b: number) => a - b);
+            const percentile = (arr: number[], p: number) => {
+              if (arr.length === 0) return 0;
+              const idx = Math.floor((p / 100) * arr.length);
+              return arr[Math.min(idx, arr.length - 1)];
+            };
+            
+            const easyCut = percentile(pops, 75);
+            const hardCut = percentile(pops, 25);
+            
+            // Use the full range from hard to easy for variety
+            minPopularity = hardCut;
+            maxPopularity = easyCut;
+            
+            console.log(`DEBUG: Using percentile-based ranges: easyCut=${easyCut}, hardCut=${hardCut}, final range=[${minPopularity}, ${maxPopularity}]`);
+          }
+          
+          // Filter tracks based on popularity range
+          const originalCount = tracks.length;
+          tracks = tracks.filter((track: any) => {
+            const popularity = track.popularity || 0;
+            return popularity >= minPopularity && popularity <= maxPopularity;
+          });
+          
+          console.log(`DEBUG: Tracks after difficulty filtering: ${tracks.length}/${originalCount} (popularity range: ${minPopularity}-${maxPopularity})`);
         }
 
         // Return a random track if we have any
