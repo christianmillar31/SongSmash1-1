@@ -191,9 +191,15 @@ class SpotifyService {
 
     // If no valid token and no refresh token, perform full authentication
     try {
+      // Clear any existing code verifier first
+      await SecureStore.deleteItemAsync('spotify_code_verifier');
+      this.codeVerifier = null;
+      
       this.codeVerifier = this.generateCodeVerifier();
-      await SecureStore.setItemAsync('spotify_code_verifier', this.codeVerifier);
       const codeChallenge = await this.generateCodeChallenge(this.codeVerifier);
+
+      // Store the code verifier securely for later use
+      await SecureStore.setItemAsync('spotify_code_verifier', this.codeVerifier);
 
       const request = new AuthSession.AuthRequest({
         clientId: SPOTIFY_CLIENT_ID,
@@ -209,7 +215,6 @@ class SpotifyService {
         responseType: AuthSession.ResponseType.Code,
         codeChallenge,
         codeChallengeMethod: CodeChallengeMethod.S256,
-        // codeVerifier is not a valid property here
       });
 
       const result = await request.promptAsync({
@@ -232,6 +237,13 @@ class SpotifyService {
     try {
       // Retrieve the code verifier from SecureStore
       this.codeVerifier = await SecureStore.getItemAsync('spotify_code_verifier');
+      
+      if (!this.codeVerifier) {
+        throw new Error('Code verifier not found in secure storage');
+      }
+
+      console.log('DEBUG: Using code verifier:', this.codeVerifier.substring(0, 10) + '...');
+      
       const response = await fetch('https://accounts.spotify.com/api/token', {
         method: 'POST',
         headers: {
@@ -242,7 +254,7 @@ class SpotifyService {
           code: code,
           redirect_uri: SPOTIFY_REDIRECT_URI,
           client_id: SPOTIFY_CLIENT_ID,
-          code_verifier: this.codeVerifier!,
+          code_verifier: this.codeVerifier,
         }).toString(),
       });
 
@@ -255,14 +267,28 @@ class SpotifyService {
         // Save tokens to secure storage
         await this.saveTokensToStorage();
         
+        // Clean up the code verifier after successful exchange
+        await SecureStore.deleteItemAsync('spotify_code_verifier');
+        this.codeVerifier = null;
+        
         console.log('Successfully authenticated with Spotify');
       } else {
         const errorText = await response.text();
         console.error('Failed to exchange code for tokens:', response.status, errorText);
+        
+        // Clean up code verifier on error
+        await SecureStore.deleteItemAsync('spotify_code_verifier');
+        this.codeVerifier = null;
+        
         throw new Error(`Token exchange failed: ${response.status}`);
       }
     } catch (error) {
       console.error('Error exchanging code for tokens:', error);
+      
+      // Clean up code verifier on any error
+      await SecureStore.deleteItemAsync('spotify_code_verifier');
+      this.codeVerifier = null;
+      
       throw error;
     }
   }

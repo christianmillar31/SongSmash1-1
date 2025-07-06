@@ -61,7 +61,7 @@ const ResultsScreen = () => {
             <Title>Final Scoreboard</Title>
             <Paragraph>Current standings after all rounds</Paragraph>
             
-            {sortedTeams.map((team, index) => (
+            {sortedTeams.map((team: any, index: number) => (
               <View key={team.id} style={styles.teamRow}>
                 <View style={styles.positionContainer}>
                   <Chip 
@@ -91,7 +91,7 @@ const ResultsScreen = () => {
               <Title>Game History</Title>
               <Paragraph>Recent tracks and scores</Paragraph>
               
-              {gameHistory.slice(-5).reverse().map((entry, index) => (
+              {gameHistory.slice(-5).reverse().map((entry: any, index: number) => (
                 <View key={index}>
                   <List.Item
                     title={entry.track.name}
@@ -134,7 +134,7 @@ const ResultsScreen = () => {
               </View>
               <View style={styles.statItem}>
                 <Title style={styles.statNumber}>
-                  {teams.length > 0 ? Math.max(...teams.map(t => t.score)) : 0}
+                  {teams.length > 0 ? Math.max(...teams.map((t: any) => t.score)) : 0}
                 </Title>
                 <Paragraph>Highest Score</Paragraph>
               </View>
