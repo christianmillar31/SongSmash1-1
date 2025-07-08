@@ -1,5 +1,5 @@
 import React from 'react';
-import { StatusBar, Text, View } from 'react-native';
+import { StatusBar, Text, View, DevSettings } from 'react-native';
 import AppNavigator from './src/navigation/AppNavigator';
 
 class ErrorBoundary extends React.Component<{children: React.ReactNode}, {hasError: boolean, error?: string}> {
@@ -27,6 +27,14 @@ class ErrorBoundary extends React.Component<{children: React.ReactNode}, {hasErr
 }
 
 export default function App() {
+  // Enable development menu
+  if (__DEV__) {
+    DevSettings.addMenuItem('Configure Bundler', () => {
+      // This will trigger the bundler configuration
+      console.log('Configure Bundler menu item pressed');
+    });
+  }
+
   return (
     <ErrorBoundary>
       <StatusBar barStyle="light-content" />
