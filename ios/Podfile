@@ -13,8 +13,6 @@ install! 'cocoapods',
 
 prepare_react_native_project!
 
-project 'SongSmash.xcodeproj'
-
 target 'SongSmash' do
   use_expo_modules!
 

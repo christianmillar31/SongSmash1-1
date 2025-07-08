@@ -30,14 +30,15 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
   web: {
     favicon: './assets/favicon.png'
   },
-  scheme: 'songsmash',
+  scheme: 'songbattle',
+  // Ensure this matches Info.plist and Spotify dashboard
   plugins: [
-    'expo-audio',
+    'expo-av',
     'expo-secure-store'
   ],
-  jsEngine: 'jsc',
+  jsEngine: 'jsc', // Use JSC for maximum compatibility
   extra: {
-    SPOTIFY_CLIENT_ID: process.env.SPOTIFY_CLIENT_ID,
-    SPOTIFY_REDIRECT_URI: process.env.SPOTIFY_REDIRECT_URI,
+    SPOTIFY_CLIENT_ID: process.env.SPOTIFY_CLIENT_ID || 'c4788e07ffa548f78f8101af9c8aa0c5',
+    SPOTIFY_REDIRECT_URI: process.env.SPOTIFY_REDIRECT_URI || 'songbattle://spotify-callback',
   },
 }); 

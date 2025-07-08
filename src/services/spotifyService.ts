@@ -2,11 +2,17 @@ import * as AuthSession from 'expo-auth-session';
 import { CodeChallengeMethod } from 'expo-auth-session';
 import * as Crypto from 'expo-crypto';
 import * as SecureStore from 'expo-secure-store';
-import { SPOTIFY_CLIENT_ID, SPOTIFY_REDIRECT_URI } from '@env';
+import Constants from 'expo-constants';
+
+// Get environment variables from Expo config (more reliable for Xcode builds)
+const SPOTIFY_CLIENT_ID = Constants.expoConfig?.extra?.SPOTIFY_CLIENT_ID || 'c4788e07ffa548f78f8101af9c8aa0c5';
+const SPOTIFY_REDIRECT_URI = Constants.expoConfig?.extra?.SPOTIFY_REDIRECT_URI || 'songbattle://spotify-callback'; // Must match app.config.ts, Info.plist, and Spotify dashboard
 
 // Debug logging for environment variables
 console.log('DEBUG: SPOTIFY_CLIENT_ID', SPOTIFY_CLIENT_ID);
 console.log('DEBUG: SPOTIFY_REDIRECT_URI', SPOTIFY_REDIRECT_URI);
+console.log('DEBUG: Environment check - Client ID length:', SPOTIFY_CLIENT_ID?.length);
+console.log('DEBUG: Environment check - Redirect URI length:', SPOTIFY_REDIRECT_URI?.length);
 
 const SPOTIFY_SCOPES = [
   'user-read-private',
@@ -179,8 +185,14 @@ class SpotifyService {
   }
 
   async authenticate(): Promise<boolean> {
+    console.log('DEBUG: Starting authentication...');
+    console.log('DEBUG: Current access token exists:', !!this.accessToken);
+    console.log('DEBUG: Current refresh token exists:', !!this.refreshToken);
+    console.log('DEBUG: Token expired:', this.isTokenExpired());
+    
     // Check if we already have a valid token
     if (this.accessToken && !this.isTokenExpired()) {
+      console.log('DEBUG: Using existing valid token');
       return true;
     }
 
