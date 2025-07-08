@@ -61,12 +61,7 @@ class ReactNativeDelegate: ExpoReactNativeFactoryDelegate {
   }
 
   override func bundleURL() -> URL? {
-#if DEBUG
-    // Use the default Metro server detection (no hardcoded IP)
-    let settings = RCTBundleURLProvider.sharedSettings()
-    return settings.jsBundleURL(forBundleRoot: ".expo/.virtual-metro-entry")
-#else
+    // Always use the bundled JavaScript file (no Metro connection needed)
     return Bundle.main.url(forResource: "main", withExtension: "jsbundle")
-#endif
   }
 }
