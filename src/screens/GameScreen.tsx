@@ -20,7 +20,7 @@ import {
 } from 'react-native-paper';
 import { Audio } from 'expo-av';
 import { useGameStore } from '../store/gameStore';
-import { appleMusicService } from '../services/appleMusicService';
+import { itunesSearchService } from '../services/itunesSearchService';
 import type { MusicTrack } from '../services/musicService';
 
 const GameScreen = () => {
@@ -49,7 +49,7 @@ const GameScreen = () => {
     }
     setLoading(true);
     try {
-      let trackOrResult = await appleMusicService.getRandomTrack(filters);
+      let trackOrResult = await itunesSearchService.getRandomTrack(filters);
       if ('noTracks' in (trackOrResult as any)) {
         Alert.alert(
           'No Track Found',
@@ -60,7 +60,7 @@ const GameScreen = () => {
               text: 'Relax Filters',
               onPress: async () => {
                 setLoading(true);
-                const relaxedTrack = await appleMusicService.getRandomTrack({ ...filters, relaxFilters: true });
+                const relaxedTrack = await itunesSearchService.getRandomTrack({ ...filters, relaxFilters: true });
                 setLoading(false);
                 if (relaxedTrack && !('noTracks' in relaxedTrack)) {
                   await playTrackInApp(relaxedTrack);

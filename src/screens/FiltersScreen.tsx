@@ -16,7 +16,7 @@ import {
   ActivityIndicator,
 } from 'react-native-paper';
 import { useGameStore } from '../store/gameStore';
-import { appleMusicService } from '../services/appleMusicService';
+import { itunesSearchService } from '../services/itunesSearchService';
 
 const FiltersScreen = () => {
   const { filters, updateFilters } = useGameStore();
@@ -46,17 +46,17 @@ const FiltersScreen = () => {
     setAuthError(null);
 
     try {
-      const isAuthenticated = await appleMusicService.authenticate();
+      const isAuthenticated = await itunesSearchService.authenticate();
 
       if (!isAuthenticated) {
         setAuthError(
-          'Apple Music developer token not configured. Please set APPLE_MUSIC_DEVELOPER_TOKEN.'
+          'Unable to connect to iTunes. Please check your internet connection.'
         );
         setLoadingGenres(false);
         return;
       }
 
-      const popularGenres = await appleMusicService.getPopularGenres();
+      const popularGenres = await itunesSearchService.getPopularGenres();
       setGenres(popularGenres);
     } catch (error) {
       console.error('Error fetching genres:', error);
@@ -71,13 +71,13 @@ const FiltersScreen = () => {
     setAuthError(null);
 
     try {
-      const isAuthenticated = await appleMusicService.authenticate();
+      const isAuthenticated = await itunesSearchService.authenticate();
 
       if (isAuthenticated) {
         await fetchGenres();
       } else {
         setAuthError(
-          'Apple Music authentication failed. Ensure the developer token is configured.'
+          'Unable to connect to iTunes. Please check your internet connection and try again.'
         );
       }
     } catch (error) {
@@ -231,7 +231,7 @@ const FiltersScreen = () => {
             <Title>Difficulty Levels</Title>
             <Paragraph>Select difficulty levels (at least one required)</Paragraph>
             <Paragraph style={styles.explanationText}>
-              {appleMusicService.getDifficultyExplanation()}
+              {itunesSearchService.getDifficultyExplanation()}
             </Paragraph>
             <View style={styles.chipContainer}>
               {difficultyLevels.map((level) => (
