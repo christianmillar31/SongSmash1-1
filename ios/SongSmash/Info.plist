@@ -58,7 +58,7 @@
 			<string>com.songsmash.app</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
-				<string>songbattle</string> <!-- Must match app.config.ts and Spotify dashboard -->
+				<string>songsmash</string> <!-- Must match app.config.ts scheme -->
 			</array>
 		</dict>
 	</array>

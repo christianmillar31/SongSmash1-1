@@ -30,15 +30,15 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
   web: {
     favicon: './assets/favicon.png'
   },
-  scheme: 'songbattle',
-  // Ensure this matches Info.plist and Spotify dashboard
+  scheme: 'songsmash',
   plugins: [
     'expo-av',
     'expo-secure-store'
   ],
   jsEngine: 'jsc', // Use JSC for maximum compatibility
   extra: {
-    SPOTIFY_CLIENT_ID: process.env.SPOTIFY_CLIENT_ID || 'c4788e07ffa548f78f8101af9c8aa0c5',
-    SPOTIFY_REDIRECT_URI: process.env.SPOTIFY_REDIRECT_URI || 'songbattle://spotify-callback',
+    // Apple Music developer token (JWT signed with your MusicKit private key).
+    // Generate via: https://developer.apple.com/documentation/applemusicapi/generating_developer_tokens
+    APPLE_MUSIC_DEVELOPER_TOKEN: process.env.APPLE_MUSIC_DEVELOPER_TOKEN || '',
   },
 }); 

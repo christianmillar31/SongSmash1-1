@@ -16,7 +16,7 @@ import {
   ActivityIndicator,
 } from 'react-native-paper';
 import { useGameStore } from '../store/gameStore';
-import { spotifyService } from '../services/spotifyService';
+import { appleMusicService } from '../services/appleMusicService';
 
 const FiltersScreen = () => {
   const { filters, updateFilters } = useGameStore();
@@ -44,18 +44,19 @@ const FiltersScreen = () => {
   const fetchGenres = async () => {
     setLoadingGenres(true);
     setAuthError(null);
-    
+
     try {
-      // Ensure authentication is completed before fetching genres
-      const isAuthenticated = await spotifyService.authenticate();
-      
+      const isAuthenticated = await appleMusicService.authenticate();
+
       if (!isAuthenticated) {
-        setAuthError('Spotify authentication required to load genres. Please try again.');
+        setAuthError(
+          'Apple Music developer token not configured. Please set APPLE_MUSIC_DEVELOPER_TOKEN.'
+        );
         setLoadingGenres(false);
         return;
       }
-      
-      const popularGenres = await spotifyService.getPopularGenres();
+
+      const popularGenres = await appleMusicService.getPopularGenres();
       setGenres(popularGenres);
     } catch (error) {
       console.error('Error fetching genres:', error);
@@ -68,14 +69,16 @@ const FiltersScreen = () => {
   const handleRetryAuthentication = async () => {
     setIsAuthenticating(true);
     setAuthError(null);
-    
+
     try {
-      const isAuthenticated = await spotifyService.authenticate();
-      
+      const isAuthenticated = await appleMusicService.authenticate();
+
       if (isAuthenticated) {
         await fetchGenres();
       } else {
-        setAuthError('Authentication was cancelled. Genre selection requires Spotify login.');
+        setAuthError(
+          'Apple Music authentication failed. Ensure the developer token is configured.'
+        );
       }
     } catch (error) {
       console.error('Error during authentication retry:', error);
@@ -112,7 +115,7 @@ const FiltersScreen = () => {
 
   const getChipStyle = (isSelected: boolean) => ({
     margin: 4,
-    backgroundColor: isSelected ? '#1DB954' : '#e0e0e0',
+    backgroundColor: isSelected ? '#FA233B' : '#e0e0e0',
   });
 
   const getChipTextStyle = (isSelected: boolean) => ({
@@ -161,7 +164,7 @@ const FiltersScreen = () => {
             <View style={styles.chipContainer}>
               {loadingGenres ? (
                 <View style={styles.loadingContainer}>
-                  <ActivityIndicator size="small" color="#1DB954" />
+                  <ActivityIndicator size="small" color="#FA233B" />
                   <Paragraph style={styles.loadingText}>Loading genres...</Paragraph>
                 </View>
               ) : authError ? (
@@ -228,7 +231,7 @@ const FiltersScreen = () => {
             <Title>Difficulty Levels</Title>
             <Paragraph>Select difficulty levels (at least one required)</Paragraph>
             <Paragraph style={styles.explanationText}>
-              {spotifyService.getDifficultyExplanation()}
+              {appleMusicService.getDifficultyExplanation()}
             </Paragraph>
             <View style={styles.chipContainer}>
               {difficultyLevels.map((level) => (
@@ -329,7 +332,7 @@ const styles = StyleSheet.create({
   },
   retryButton: {
     marginTop: 8,
-    backgroundColor: '#1DB954',
+    backgroundColor: '#FA233B',
   },
 });
 

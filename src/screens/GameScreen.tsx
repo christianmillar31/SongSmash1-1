@@ -20,7 +20,8 @@ import {
 } from 'react-native-paper';
 import { Audio } from 'expo-av';
 import { useGameStore } from '../store/gameStore';
-import { spotifyService, SpotifyTrack } from '../services/spotifyService';
+import { appleMusicService } from '../services/appleMusicService';
+import type { MusicTrack } from '../services/musicService';
 
 const GameScreen = () => {
   const { teams, filters, currentTrack, setCurrentTrack, addToHistory, setIsPlaying, isPlaying } = useGameStore();
@@ -48,7 +49,7 @@ const GameScreen = () => {
     }
     setLoading(true);
     try {
-      let trackOrResult = await spotifyService.getRandomTrack(filters);
+      let trackOrResult = await appleMusicService.getRandomTrack(filters);
       if ('noTracks' in (trackOrResult as any)) {
         Alert.alert(
           'No Track Found',
@@ -59,7 +60,7 @@ const GameScreen = () => {
               text: 'Relax Filters',
               onPress: async () => {
                 setLoading(true);
-                const relaxedTrack = await spotifyService.getRandomTrack({ ...filters, relaxFilters: true });
+                const relaxedTrack = await appleMusicService.getRandomTrack({ ...filters, relaxFilters: true });
                 setLoading(false);
                 if (relaxedTrack && !('noTracks' in relaxedTrack)) {
                   await playTrackInApp(relaxedTrack);
@@ -82,13 +83,14 @@ const GameScreen = () => {
     }
   };
 
-  const playTrackInApp = async (track: SpotifyTrack) => {
+  const playTrackInApp = async (track: MusicTrack) => {
     setCurrentTrack(track);
     setShowScores(false);
     setScores({});
-    
+
     try {
-      // Check if track has a preview URL (30 seconds)
+      // All tracks from Apple Music service should have preview URLs
+      // (tracks without previews are filtered out during discovery)
       if (track.preview_url) {
         console.log('Playing 30-second preview in app');
         const { sound: newSound } = await Audio.Sound.createAsync(
@@ -97,8 +99,7 @@ const GameScreen = () => {
         );
         setSound(newSound);
         setIsPlaying(true);
-        
-        // Set up the onPlaybackStatusUpdate to handle when preview ends
+
         newSound.setOnPlaybackStatusUpdate((status) => {
           if (status.isLoaded && status.didJustFinish) {
             setIsPlaying(false);
@@ -106,23 +107,22 @@ const GameScreen = () => {
           }
         });
       } else {
-        // No preview URL - open full track in Spotify from beginning
-        console.log('Opening full track in Spotify from beginning');
-        if (track.external_urls?.spotify) {
+        // Fallback: open in Apple Music (should rarely happen)
+        console.log('Opening track in Apple Music');
+        if (track.external_urls?.web) {
           Alert.alert(
-            'Full Track in Spotify', 
-            'Opening the full track in Spotify from the beginning. Listen to the song, then return here to score!',
+            'Open in Apple Music',
+            'Opening the track in Apple Music. Listen to the song, then return here to score!',
             [
               { text: 'Cancel', style: 'cancel' },
-              { 
-                text: 'Open Spotify', 
+              {
+                text: 'Open Apple Music',
                 onPress: () => {
-                  Linking.openURL(track.external_urls.spotify);
-                  // Allow scoring after a delay
+                  Linking.openURL(track.external_urls.web);
                   setTimeout(() => {
                     setIsPlaying(false);
                     setShowScores(true);
-                  }, 30000); // 30 seconds
+                  }, 30000);
                 }
               }
             ]
@@ -260,7 +260,7 @@ const GameScreen = () => {
                     <Paragraph>
                       {currentTrack.preview_url 
                         ? 'Listen to the 30-second preview and guess the song!'
-                        : 'Opening full track in Spotify from the beginning. Listen and return here to score!'
+                        : 'Opening track in Apple Music. Listen and return here to score!'
                       }
                     </Paragraph>
                     
@@ -387,7 +387,7 @@ const styles = StyleSheet.create({
   },
   playButton: {
     marginTop: 16,
-    backgroundColor: '#1DB954',
+    backgroundColor: '#FA233B',
   },
   trackCard: {
     marginBottom: 16,
@@ -424,7 +424,7 @@ const styles = StyleSheet.create({
   },
   submitButton: {
     marginTop: 16,
-    backgroundColor: '#1DB954',
+    backgroundColor: '#FA233B',
   },
   filtersCard: {
     marginBottom: 16,
