@@ -31,14 +31,15 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
     favicon: './assets/favicon.png'
   },
   scheme: 'songbattle',
-  // Ensure this matches Info.plist and Spotify dashboard
   plugins: [
     'expo-av',
     'expo-secure-store'
   ],
   jsEngine: 'jsc', // Use JSC for maximum compatibility
   extra: {
-    SPOTIFY_CLIENT_ID: process.env.SPOTIFY_CLIENT_ID || 'c4788e07ffa548f78f8101af9c8aa0c5',
-    SPOTIFY_REDIRECT_URI: process.env.SPOTIFY_REDIRECT_URI || 'songbattle://spotify-callback',
+    // Optional: Apple Music API developer token (see scripts/generate-apple-music-token.mjs).
+    // Without it the app falls back to the keyless iTunes Search API.
+    APPLE_MUSIC_DEV_TOKEN: process.env.APPLE_MUSIC_DEV_TOKEN || '',
+    APPLE_MUSIC_STOREFRONT: process.env.APPLE_MUSIC_STOREFRONT || 'us',
   },
 }); 

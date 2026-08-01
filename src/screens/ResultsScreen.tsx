@@ -95,7 +95,7 @@ const ResultsScreen = () => {
                 <View key={index}>
                   <List.Item
                     title={entry.track.name}
-                    description={`${entry.track.artists.map((artist: { name: string }) => artist.name).join(', ')}`}
+                    description={entry.track.artistName}
                     left={(props) => (
                       <List.Icon {...props} icon="music" />
                     )}

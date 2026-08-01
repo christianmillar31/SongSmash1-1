@@ -1,4 +1,4 @@
 declare module '@env' {
-  export const SPOTIFY_CLIENT_ID: string;
-  export const SPOTIFY_REDIRECT_URI: string;
-} 
+  export const APPLE_MUSIC_DEV_TOKEN: string;
+  export const APPLE_MUSIC_STOREFRONT: string;
+}
