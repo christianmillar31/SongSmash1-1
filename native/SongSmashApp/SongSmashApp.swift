@@ -562,6 +562,10 @@ struct ContentView: View {
                 ]
                 gameManager.gameSettings.genres = ["Rock"]
                 gameManager.gameSettings.decades = ["1980s"]
+                if UserDefaults.standard.string(forKey: "DemoGenres") == "none" {
+                    gameManager.gameSettings.genres = []
+                    gameManager.gameSettings.decades = []
+                }
                 switch UserDefaults.standard.string(forKey: "AutoDemoState") {
                 case "setup":
                     break // seeded settings only; stay on the setup screen
@@ -574,7 +578,7 @@ struct ContentView: View {
                         await gameManager.loadTracks()
                         gameManager.startGame()
                         if let firstTrack = gameManager.availableTracks.first {
-                            MusicService.shared.markTrackAsPlayed(firstTrack.id)
+                            MusicService.shared.markTrackAsPlayed(firstTrack)
                             playerManager.playSong(firstTrack) { success in
                                 if success {
                                     gameManager.nextRound(title: firstTrack.name, artist: firstTrack.artistName)
@@ -630,13 +634,9 @@ struct GameSetupView: View {
     let availableGenres = ["Pop", "Rock", "Hip-Hop", "Country", "R&B", "Electronic", "Jazz", "Classical", "Indie", "Alternative"]
     let availableDecades = ["2020s", "2010s", "2000s", "1990s", "1980s", "1970s", "1960s"]
 
-    // Honest completion: only the parts the player actually has to do.
+    // Honest completion: teams are the only requirement; music filters are optional.
     var setupCompletion: Double {
-        var completed = 0.0
-        if gameManager.gameSettings.teams.count >= 2 { completed += 0.4 }
-        if !gameManager.gameSettings.genres.isEmpty { completed += 0.3 }
-        if !gameManager.gameSettings.decades.isEmpty { completed += 0.3 }
-        return completed
+        Double(min(gameManager.gameSettings.teams.count, 2)) / 2.0
     }
 
     var body: some View {
@@ -752,7 +752,7 @@ struct GameSetupView: View {
                                 .font(.body)
                             Spacer()
                             if gameManager.gameSettings.genres.isEmpty {
-                                Text("Select")
+                                Text("All genres")
                                     .font(.subheadline)
                                     .foregroundColor(.secondary)
                             } else {
@@ -788,7 +788,7 @@ struct GameSetupView: View {
                                 .font(.body)
                             Spacer()
                             if gameManager.gameSettings.decades.isEmpty {
-                                Text("Select")
+                                Text("All decades")
                                     .font(.subheadline)
                                     .foregroundColor(.secondary)
                             } else {
@@ -911,7 +911,7 @@ struct GameSetupView: View {
                     await gameManager.loadTracks()
                     guard let firstTrack = gameManager.availableTracks.first else { return }
                     gameManager.startGame()
-                    MusicService.shared.markTrackAsPlayed(firstTrack.id)
+                    MusicService.shared.markTrackAsPlayed(firstTrack)
                     playerManager.playSong(firstTrack) { success in
                         if success {
                             gameManager.nextRound(
@@ -922,7 +922,7 @@ struct GameSetupView: View {
                     }
                 }
             },
-            isEnabled: gameManager.gameSettings.teams.count >= 2 && !gameManager.gameSettings.genres.isEmpty && !gameManager.gameSettings.decades.isEmpty,
+            isEnabled: gameManager.gameSettings.teams.count >= 2,
             isLoading: gameManager.isLoadingTracks
         )
         .padding(.horizontal)
@@ -1290,7 +1290,7 @@ struct GamePlayView: View {
     // One scoring model: tap a team to cycle 0 → 1 → 2 points.
     private var scoringChips: some View {
         VStack(spacing: DesignSystem.spacing.sm) {
-            Text("Who got it? Tap to cycle · 1 title · 2 title + artist")
+            Text("Tap a team once = artist or title (+1) · twice = both (+2)")
                 .font(.caption)
                 .foregroundColor(.secondary)
 
@@ -1423,7 +1423,7 @@ struct GamePlayView: View {
         }
 
         if let track = nextTrack {
-            MusicService.shared.markTrackAsPlayed(track.id)
+            MusicService.shared.markTrackAsPlayed(track)
             playerManager.playSong(track) { success in
                 if success {
                     gameManager.nextRound(title: track.name, artist: track.artistName)
@@ -1522,7 +1522,7 @@ struct GameFinishedView: View {
                                 await gameManager.loadTracks()
                                 guard let firstTrack = gameManager.availableTracks.first else { return }
                                 gameManager.startGame()
-                                MusicService.shared.markTrackAsPlayed(firstTrack.id)
+                                MusicService.shared.markTrackAsPlayed(firstTrack)
                                 playerManager.playSong(firstTrack) { success in
                                     if success {
                                         gameManager.nextRound(title: firstTrack.name, artist: firstTrack.artistName)

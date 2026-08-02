@@ -43,6 +43,9 @@ final class MusicService {
     private var albumCache: [String: [Track]] = [:]
     private var searchCache: [String: [Track]] = [:]
     private var playedTrackIDs: Set<String> = []
+    // Songs heard in ANY game this session (by title+artist, so remasters and
+    // re-releases count as the same song). Keeps "Play Again" fresh.
+    private var sessionPlayedSongs: Set<String> = []
 
     // Apple genre IDs are shared between the Apple Music API and iTunes.
     // Keys match GameSetupView's availableGenres.
@@ -80,10 +83,11 @@ final class MusicService {
         playedTrackIDs.removeAll()
 
         let genreList = genres.filter { Self.genreIDs[$0] != nil }
-        let effectiveGenres = genreList.isEmpty ? ["Pop", "Rock"] : genreList
+        // No genres selected = all music: the overall charts (genre nil).
+        let genreKeys: [String?] = genreList.isEmpty ? [nil] : genreList
 
         var pool: [Track] = []
-        for genre in effectiveGenres {
+        for genre in genreKeys {
             let chart = await chartTracks(genre: genre)
             let chartInDecades = filterByDecades(chart, decades: decades)
             pool += chartInDecades.filter { wantedTiers(for: difficulty).contains($0.tier) }
@@ -100,21 +104,23 @@ final class MusicService {
             }
         }
 
-        var queue = dedupe(pool).filter { $0.previewUrl != nil }
+        var queue = dedupeSongs(pool).filter { $0.previewUrl != nil }
 
-        // Thin result: relax the tier requirement before giving up.
-        if queue.count < 15 {
-            queue = dedupe(pool + queue)
-                .filter { $0.previewUrl != nil }
+        // Prefer songs not heard in any game this session; only fall back to
+        // repeats if that would leave too small a queue.
+        let fresh = queue.filter { !sessionPlayedSongs.contains(songKey($0)) }
+        if fresh.count >= 15 {
+            queue = fresh
         }
 
         queue.shuffle()
-        print("[MusicService] Built queue of \(queue.count) tracks for genres=\(effectiveGenres) decades=\(decades) difficulty=\(difficulty.rawValue)")
+        print("[MusicService] Built queue of \(queue.count) tracks (\(fresh.count) unheard) for genres=\(genreList.isEmpty ? ["All"] : genreList) decades=\(decades) difficulty=\(difficulty.rawValue)")
         return Array(queue.prefix(150))
     }
 
-    func markTrackAsPlayed(_ trackID: String) {
-        playedTrackIDs.insert(trackID)
+    func markTrackAsPlayed(_ track: Track) {
+        playedTrackIDs.insert(track.id)
+        sessionPlayedSongs.insert(songKey(track))
     }
 
     func shouldSkipTrack(_ track: Track) -> Bool {
@@ -145,22 +151,36 @@ final class MusicService {
         return (start, start + 9)
     }
 
-    private func matchesGenre(label: String?, genre: String) -> Bool {
+    private func matchesGenre(label: String?, genre: String?) -> Bool {
+        guard let genre else { return true } // "all music" — every genre matches
         guard let label = label?.lowercased() else { return false }
         let matchers = genreMatchers[genre] ?? [genre.lowercased()]
         return matchers.contains { label.contains($0) || $0.contains(label) }
     }
 
-    private func dedupe(_ tracks: [Track]) -> [Track] {
-        var seen = Set<String>()
-        return tracks.filter { seen.insert($0.id).inserted }
+    // "Billie Jean", "Billie Jean (Remastered)" and "Billie Jean - Single" are
+    // the same song; key on cleaned title + artist, not track ID.
+    private func songKey(_ track: Track) -> String {
+        var title = track.name.lowercased()
+        for separator in [" (", " [", " - "] {
+            if let range = title.range(of: separator) {
+                title = String(title[..<range.lowerBound])
+            }
+        }
+        return title.trimmingCharacters(in: .whitespaces) + "|" + track.artistName.lowercased()
+    }
+
+    private func dedupeSongs(_ tracks: [Track]) -> [Track] {
+        var ids = Set<String>()
+        var keys = Set<String>()
+        return tracks.filter { ids.insert($0.id).inserted && keys.insert(songKey($0)).inserted }
     }
 
     // MARK: - Pool builders
 
     /// Top-of-chart tracks for a genre, tiered easy/medium by rank.
-    private func chartTracks(genre: String) async -> [Track] {
-        let cacheKey = "chart:\(genre)"
+    private func chartTracks(genre: String?) async -> [Track] {
+        let cacheKey = "chart:\(genre ?? "all")"
         if let cached = chartCache[cacheKey] { return cached }
 
         var tracks: [Track] = []
@@ -200,12 +220,12 @@ final class MusicService {
     }
 
     /// Songs from a decade within a genre, tiered by search rank.
-    private func decadeTracks(decade: String, genre: String) async -> [Track] {
-        let cacheKey = "decade:\(decade):\(genre)"
+    private func decadeTracks(decade: String, genre: String?) async -> [Track] {
+        let cacheKey = "decade:\(decade):\(genre ?? "all")"
         if let cached = searchCache[cacheKey] { return cached }
 
         let shorthand = decade.count == 5 ? String(decade.dropFirst(2)) : decade
-        let term = "\(shorthand) \(genre)"
+        let term = "\(shorthand) \(genre ?? "hits")"
 
         var results: [Track] = []
         if useAppleMusic {
@@ -295,8 +315,8 @@ final class MusicService {
         )
     }
 
-    private func appleChartTracks(genre: String) async throws -> [Track] {
-        let genreParam = Self.genreIDs[genre].map { "&genre=\($0)" } ?? ""
+    private func appleChartTracks(genre: String?) async throws -> [Track] {
+        let genreParam = genre.flatMap { Self.genreIDs[$0] }.map { "&genre=\($0)" } ?? ""
         var tracks: [Track] = []
         for offset in [0, 50] {
             let data = try await appleFetch("/charts?types=songs&limit=50&offset=\(offset)\(genreParam)")
@@ -358,8 +378,8 @@ final class MusicService {
         )
     }
 
-    private func itunesChartTracks(genre: String) async throws -> [Track] {
-        let genreSegment = Self.genreIDs[genre].map { "/genre=\($0)" } ?? ""
+    private func itunesChartTracks(genre: String?) async throws -> [Track] {
+        let genreSegment = genre.flatMap { Self.genreIDs[$0] }.map { "/genre=\($0)" } ?? ""
         let rss = try await itunesFetch("https://itunes.apple.com/\(storefront)/rss/topsongs/limit=100\(genreSegment)/json")
         let feed = rss["feed"] as? [String: Any]
         let entries = feed?["entry"] as? [[String: Any]] ?? []
