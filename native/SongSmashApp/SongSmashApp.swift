@@ -170,6 +170,48 @@ class PlayerManager: NSObject, ObservableObject {
     }
 }
 
+// Snapshot of the setup that survives app relaunches, so a returning game
+// night doesn't have to re-enter teams and settings. Scores are not saved.
+private struct SavedSetup: Codable {
+    struct SavedTeam: Codable {
+        var name: String
+        var colorName: String
+    }
+
+    var teams: [SavedTeam]
+    var genres: [String]
+    var decades: [String]
+    var difficulty: String
+    var targetScore: Int
+
+    private static let key = "SavedGameSetup"
+
+    static func save(_ settings: GameSettings) {
+        let snapshot = SavedSetup(
+            teams: settings.teams.map { SavedTeam(name: $0.name, colorName: $0.colorName) },
+            genres: settings.genres,
+            decades: settings.decades,
+            difficulty: settings.difficulty.rawValue,
+            targetScore: settings.targetScore
+        )
+        if let data = try? JSONEncoder().encode(snapshot) {
+            UserDefaults.standard.set(data, forKey: key)
+        }
+    }
+
+    static func restore() -> GameSettings? {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let snapshot = try? JSONDecoder().decode(SavedSetup.self, from: data) else { return nil }
+        var settings = GameSettings()
+        settings.teams = snapshot.teams.map { Team(name: $0.name, colorName: $0.colorName) }
+        settings.genres = snapshot.genres
+        settings.decades = snapshot.decades
+        settings.difficulty = Difficulty(rawValue: snapshot.difficulty) ?? .medium
+        settings.targetScore = snapshot.targetScore
+        return settings
+    }
+}
+
 // MARK: - Game Manager
 class GameManager: ObservableObject {
     @Published var gameSettings = GameSettings()
@@ -181,8 +223,20 @@ class GameManager: ObservableObject {
     @Published var isLoadingTracks = false
     @Published var loadError: String?
 
+    private var cancellables = Set<AnyCancellable>()
+
     enum GameState {
         case setup, playing, paused, finished
+    }
+
+    init() {
+        if let saved = SavedSetup.restore() {
+            gameSettings = saved
+        }
+        $gameSettings
+            .dropFirst()
+            .sink { SavedSetup.save($0) }
+            .store(in: &cancellables)
     }
 
     var currentRoundNumber: Int {
