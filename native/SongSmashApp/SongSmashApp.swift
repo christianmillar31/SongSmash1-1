@@ -90,7 +90,7 @@ struct GameSettings {
     var genres: [String] = []
     var decades: [String] = []
     var difficulty: Difficulty = .medium
-    var rounds: Int = 25
+    var targetScore: Int = 25
     var teams: [Team] = []
 }
 
@@ -189,13 +189,24 @@ class GameManager: ObservableObject {
         rounds.count + 1
     }
 
+    var leadingScore: Int {
+        gameSettings.teams.map(\.score).max() ?? 0
+    }
+
     var progress: Double {
-        Double(rounds.count) / Double(gameSettings.rounds)
+        guard gameSettings.targetScore > 0 else { return 0 }
+        return min(1.0, Double(leadingScore) / Double(gameSettings.targetScore))
+    }
+
+    var hasReachedTargetScore: Bool {
+        leadingScore >= gameSettings.targetScore
     }
 
     func startGame() {
         gameState = .playing
         rounds = []
+        currentRound = nil
+        showAnswer = false
         resetScores()
     }
 
@@ -227,15 +238,7 @@ class GameManager: ObservableObject {
     func nextRound(title: String, artist: String) {
         if let current = currentRound {
             rounds.append(current)
-
-            // Check if we've completed all rounds AFTER appending
-            if rounds.count >= gameSettings.rounds {
-                currentRound = nil
-                endGame()
-                return
-            }
         }
-
         currentRound = Round(songTitle: title, artist: artist)
         showAnswer = false
     }
@@ -243,8 +246,9 @@ class GameManager: ObservableObject {
     func endGame() {
         if let current = currentRound {
             rounds.append(current)
+            currentRound = nil
         }
-        print("Game ended with \(rounds.count) rounds played out of \(gameSettings.rounds) total")
+        print("Game ended after \(rounds.count) rounds, leading score \(leadingScore) of \(gameSettings.targetScore)")
         gameState = .finished
     }
 
@@ -630,6 +634,7 @@ struct GameSetupView: View {
     @State private var showingTeamSetup = UserDefaults.standard.bool(forKey: "ShowTeamSetup")
     @State private var showingGenreSelection = UserDefaults.standard.bool(forKey: "ShowGenreSelection")
     @State private var showingDecadeSelection = UserDefaults.standard.bool(forKey: "ShowDecadeSelection")
+    @State private var editingTeam: Team?
 
     let availableGenres = ["Pop", "Rock", "Hip-Hop", "Country", "R&B", "Electronic", "Jazz", "Classical", "Indie", "Alternative"]
     let availableDecades = ["2020s", "2010s", "2000s", "1990s", "1980s", "1970s", "1960s"]
@@ -666,8 +671,11 @@ struct GameSetupView: View {
             .padding(.vertical)
         }
         .sheet(isPresented: $showingTeamSetup) {
-                TeamSetupView()
-            }
+            TeamSetupView()
+        }
+        .sheet(item: $editingTeam) { team in
+            TeamSetupView(teamToEdit: team)
+        }
         .sheet(isPresented: $showingGenreSelection) {
             SelectionView(
                 title: "Select Genres",
@@ -725,11 +733,33 @@ struct GameSetupView: View {
                     ForEach(gameManager.gameSettings.teams) { team in
                         HStack(spacing: DesignSystem.spacing.md) {
                             TeamAvatar(team: team, size: 36)
-                            Text(team.name)
-                                .font(.body)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(team.name)
+                                    .font(.body)
+                                Text("Tap to edit")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
                             Spacer()
+                            Button(action: {
+                                Haptics.tap()
+                                withAnimation(DesignSystem.snappy) {
+                                    gameManager.gameSettings.teams.removeAll { $0.id == team.id }
+                                }
+                            }) {
+                                Image(systemName: "minus.circle.fill")
+                                    .font(.title3)
+                                    .foregroundColor(DesignSystem.colors.danger.opacity(0.85))
+                                    .frame(width: 44, height: 44)
+                            }
+                            .buttonStyle(PressableButtonStyle())
                         }
                         .padding(.vertical, DesignSystem.spacing.xs)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            Haptics.tap()
+                            editingTeam = team
+                        }
                     }
                 }
             }
@@ -839,42 +869,46 @@ struct GameSetupView: View {
 
                 Divider()
 
-                // Rounds — chunky ±44pt controls instead of a fiddly stepper
+                // Target score — chunky ±44pt controls instead of a fiddly stepper
                 VStack(alignment: .leading, spacing: DesignSystem.spacing.sm) {
-                    Text("Number of Rounds")
+                    Text("Playing To")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
 
                     HStack {
-                        Text("\(gameManager.gameSettings.rounds)")
+                        Text("\(gameManager.gameSettings.targetScore) points")
                             .font(.title.weight(.semibold))
                             .contentTransition(.numericText())
 
                         Spacer()
 
                         HStack(spacing: DesignSystem.spacing.sm) {
-                            roundsButton(systemName: "minus") {
-                                if gameManager.gameSettings.rounds > 10 {
+                            stepperButton(systemName: "minus") {
+                                if gameManager.gameSettings.targetScore > 5 {
                                     withAnimation(DesignSystem.snappy) {
-                                        gameManager.gameSettings.rounds -= 5
+                                        gameManager.gameSettings.targetScore -= 5
                                     }
                                 }
                             }
-                            roundsButton(systemName: "plus") {
-                                if gameManager.gameSettings.rounds < 50 {
+                            stepperButton(systemName: "plus") {
+                                if gameManager.gameSettings.targetScore < 100 {
                                     withAnimation(DesignSystem.snappy) {
-                                        gameManager.gameSettings.rounds += 5
+                                        gameManager.gameSettings.targetScore += 5
                                     }
                                 }
                             }
                         }
                     }
+
+                    Text("First team to \(gameManager.gameSettings.targetScore) points wins")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
             }
         }
     }
 
-    private func roundsButton(systemName: String, action: @escaping () -> Void) -> some View {
+    private func stepperButton(systemName: String, action: @escaping () -> Void) -> some View {
         Button(action: {
             Haptics.tap()
             action()
@@ -934,8 +968,15 @@ struct GameSetupView: View {
 struct TeamSetupView: View {
     @EnvironmentObject var gameManager: GameManager
     @Environment(\.dismiss) var dismiss
-    @State private var teamName = ""
-    @State private var selectedColorName = "blue"
+    var teamToEdit: Team?
+    @State private var teamName: String
+    @State private var selectedColorName: String
+
+    init(teamToEdit: Team? = nil) {
+        self.teamToEdit = teamToEdit
+        _teamName = State(initialValue: teamToEdit?.name ?? "")
+        _selectedColorName = State(initialValue: teamToEdit?.colorName ?? "blue")
+    }
 
     let colorOptions: [(name: String, color: Color)] = [
         ("red", .red),
@@ -949,9 +990,14 @@ struct TeamSetupView: View {
         ("indigo", .indigo)
     ]
 
+    private var trimmedName: String {
+        teamName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     var body: some View {
         NavigationView {
-            VStack(spacing: DesignSystem.spacing.lg) {
+            ScrollView {
+                VStack(spacing: DesignSystem.spacing.lg) {
                 // Team Name Input
                 VStack(alignment: .leading, spacing: DesignSystem.spacing.sm) {
                     Text("Team Name")
@@ -970,6 +1016,8 @@ struct TeamSetupView: View {
                                 .strokeBorder(.white.opacity(0.15), lineWidth: 0.75)
                         )
                         .textInputAutocapitalization(.words)
+                        .submitLabel(.done)
+                        .onSubmit { saveTeam() }
                 }
 
                 // Color Selection
@@ -1005,21 +1053,15 @@ struct TeamSetupView: View {
                     }
                 }
 
-                Spacer()
-
                 PrimaryButton(
-                    title: "Add Team",
-                    action: {
-                        let team = Team(name: teamName, colorName: selectedColorName)
-                        gameManager.gameSettings.teams.append(team)
-                        Haptics.score()
-                        dismiss()
-                    },
-                    isEnabled: !teamName.isEmpty
+                    title: teamToEdit == nil ? "Add Team" : "Save Changes",
+                    action: { saveTeam() },
+                    isEnabled: !trimmedName.isEmpty
                 )
+                }
+                .padding()
             }
-            .padding()
-            .navigationTitle("Add Team")
+            .navigationTitle(teamToEdit == nil ? "Add Team" : "Edit Team")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
@@ -1029,6 +1071,19 @@ struct TeamSetupView: View {
         }
         .presentationBackground(.ultraThinMaterial)
         .presentationDetents([.medium, .large])
+    }
+
+    private func saveTeam() {
+        guard !trimmedName.isEmpty else { return }
+        if let teamToEdit,
+           let index = gameManager.gameSettings.teams.firstIndex(where: { $0.id == teamToEdit.id }) {
+            gameManager.gameSettings.teams[index].name = trimmedName
+            gameManager.gameSettings.teams[index].colorName = selectedColorName
+        } else {
+            gameManager.gameSettings.teams.append(Team(name: trimmedName, colorName: selectedColorName))
+        }
+        Haptics.score()
+        dismiss()
     }
 }
 
@@ -1153,7 +1208,7 @@ struct GamePlayView: View {
     private var topBar: some View {
         VStack(spacing: DesignSystem.spacing.sm) {
             HStack {
-                Text("Round \(gameManager.currentRoundNumber) of \(gameManager.gameSettings.rounds)")
+                Text("Round \(gameManager.currentRoundNumber) · First to \(gameManager.gameSettings.targetScore)")
                     .font(.headline)
                     .contentTransition(.numericText())
                 Spacer()
@@ -1409,7 +1464,7 @@ struct GamePlayView: View {
     private func advanceToNextSong() {
         applyRoundScores()
 
-        if gameManager.rounds.count >= gameManager.gameSettings.rounds - 1 {
+        if gameManager.hasReachedTargetScore {
             playerManager.stopPlayback()
             gameManager.endGame()
             return
