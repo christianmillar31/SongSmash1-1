@@ -915,10 +915,6 @@ struct GameSetupView: View {
                         }
                     }
                     .pickerStyle(SegmentedPickerStyle())
-
-                    Text(gameManager.gameSettings.difficulty.description)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
                 }
 
                 Divider()
@@ -953,10 +949,6 @@ struct GameSetupView: View {
                             }
                         }
                     }
-
-                    Text("First team to \(gameManager.gameSettings.targetScore) points wins")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
                 }
             }
         }
