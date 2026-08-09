@@ -30,8 +30,9 @@ struct Track: Codable, Hashable, Identifiable {
 //    developer portal; until then every request 401s and we fall back.
 //  - iTunes Search/RSS (itunes.apple.com), keyless fallback. Rate-limited
 //    (~20 req/min); the per-game queue build stays well under it.
-// Catalog-only: no user sign-in, no Apple Music subscription needed —
-// MusicAuthorization is never requested.
+// Catalog-only: no Apple Music subscription needed, but MusicKit requires the
+// one-time MusicAuthorization prompt (it refuses even catalog requests while
+// status is .notDetermined). Declining just means the iTunes fallback serves.
 final class MusicService {
     static let shared = MusicService()
 
@@ -84,6 +85,7 @@ final class MusicService {
     /// a playable preview are returned.
     func loadTracks(genres: [String], decades: [String], difficulty: Difficulty) async throws -> [Track] {
         playedTrackIDs.removeAll()
+        await ensureMusicKitAuthorization()
 
         let genreList = genres.filter { Self.genreIDs[$0] != nil }
         // No genres selected = all music: the overall charts (genre nil).
@@ -280,8 +282,20 @@ final class MusicService {
 
     // MARK: - MusicKit backend
 
+    // Authorization is re-checked per queue build (not latched), so granting
+    // access later in Settings upgrades the next game without a relaunch.
     private var useMusicKit: Bool {
-        !musicKitDown
+        !musicKitDown && MusicAuthorization.currentStatus == .authorized
+    }
+
+    /// Triggers the one-time system prompt. Any outcome other than .authorized
+    /// simply leaves the iTunes fallback serving.
+    private func ensureMusicKitAuthorization() async {
+        guard !musicKitDown, MusicAuthorization.currentStatus == .notDetermined else { return }
+        let status = await MusicAuthorization.request()
+        if status != .authorized {
+            print("[MusicService] Apple Music access not granted (\(status)); using iTunes catalog")
+        }
     }
 
     private var genreCache: [Int: Genre] = [:]
