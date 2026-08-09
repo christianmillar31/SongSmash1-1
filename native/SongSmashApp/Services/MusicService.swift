@@ -1,4 +1,5 @@
 import Foundation
+import MusicKit
 
 // MARK: - Track Model (Apple catalog)
 struct Track: Codable, Hashable, Identifiable {
@@ -23,10 +24,14 @@ struct Track: Codable, Hashable, Identifiable {
 // MARK: - Music Service
 // Discovery + previews from Apple's catalog. Replaces the removed Spotify APIs.
 // Two backends sharing the same catalog and genre IDs:
-//  - Apple Music API (api.music.apple.com), used when an APPLE_MUSIC_DEV_TOKEN
-//    Info.plist key is present. Developer JWT only — no user login.
+//  - MusicKit (preferred): Apple's supported framework, automatic developer
+//    token, documented rate limits, storefront follows the device region.
+//    Requires the MusicKit app service to be enabled for this App ID in the
+//    developer portal; until then every request 401s and we fall back.
 //  - iTunes Search/RSS (itunes.apple.com), keyless fallback. Rate-limited
 //    (~20 req/min); the per-game queue build stays well under it.
+// Catalog-only: no user sign-in, no Apple Music subscription needed —
+// MusicAuthorization is never requested.
 final class MusicService {
     static let shared = MusicService()
 
@@ -34,10 +39,8 @@ final class MusicService {
         case easy, medium, hard
     }
 
-    private let storefront = "us"
-    private lazy var devToken: String =
-        (Bundle.main.object(forInfoDictionaryKey: "APPLE_MUSIC_DEV_TOKEN") as? String) ?? ""
-    private var appleMusicDown = false
+    private let storefront = "us" // iTunes fallback only; MusicKit picks its own
+    private var musicKitDown = false
 
     private var chartCache: [String: [Track]] = [:]
     private var albumCache: [String: [Track]] = [:]
@@ -184,13 +187,13 @@ final class MusicService {
         if let cached = chartCache[cacheKey] { return cached }
 
         var tracks: [Track] = []
-        if useAppleMusic {
-            do { tracks = try await appleChartTracks(genre: genre) }
-            catch { demoteAppleMusic(error) }
+        if useMusicKit {
+            do { tracks = try await musicKitChartTracks(genre: genre) }
+            catch { demoteMusicKit(error) }
         }
         if tracks.isEmpty {
             do { tracks = try await itunesChartTracks(genre: genre) }
-            catch { print("[MusicService] chart fetch failed for \(genre): \(error)") }
+            catch { print("[MusicService] chart fetch failed for \(genre ?? "all"): \(error)") }
         }
 
         tracks = tracks.enumerated().map { index, track in
@@ -208,7 +211,7 @@ final class MusicService {
         let sources = chart.shuffled().prefix(deepCutSources)
         var cuts: [Track] = []
         for source in sources {
-            guard let albumId = source.albumId else { continue }
+            guard let albumId = await albumId(for: source) else { continue }
             let albumTracks = await tracksForAlbum(albumId)
             let fresh = albumTracks.filter { $0.id != source.id && !chartIDs.contains($0.id) }
             for var cut in fresh.shuffled().prefix(deepCutsPerAlbum) {
@@ -228,9 +231,9 @@ final class MusicService {
         let term = "\(shorthand) \(genre ?? "hits")"
 
         var results: [Track] = []
-        if useAppleMusic {
-            do { results = try await appleSearchTracks(term: term) }
-            catch { demoteAppleMusic(error) }
+        if useMusicKit {
+            do { results = try await musicKitSearchTracks(term: term) }
+            catch { demoteMusicKit(error) }
         }
         if results.isEmpty {
             do { results = try await itunesSearchTracks(term: term) }
@@ -254,9 +257,9 @@ final class MusicService {
     private func tracksForAlbum(_ albumId: String) async -> [Track] {
         if let cached = albumCache[albumId] { return cached }
         var tracks: [Track] = []
-        if useAppleMusic {
-            do { tracks = try await appleAlbumTracks(albumId: albumId) }
-            catch { demoteAppleMusic(error) }
+        if useMusicKit {
+            do { tracks = try await musicKitAlbumTracks(albumId: albumId) }
+            catch { demoteMusicKit(error) }
         }
         if tracks.isEmpty {
             do { tracks = try await itunesAlbumTracks(albumId: albumId) }
@@ -266,88 +269,108 @@ final class MusicService {
         return tracks
     }
 
-    // MARK: - Apple Music API backend (developer token)
-
-    private var useAppleMusic: Bool {
-        !devToken.isEmpty && !appleMusicDown
+    /// MusicKit chart songs don't carry their album relationship inline;
+    /// resolve it on demand (only needed when mining deep cuts for hard mode).
+    private func albumId(for track: Track) async -> String? {
+        if let albumId = track.albumId { return albumId }
+        guard useMusicKit else { return nil }
+        do { return try await musicKitAlbumId(forSongId: track.id) }
+        catch { demoteMusicKit(error); return nil }
     }
 
-    private func demoteAppleMusic(_ error: Error) {
-        if !appleMusicDown {
-            print("[MusicService] Apple Music API unavailable, falling back to iTunes: \(error)")
-            appleMusicDown = true
+    // MARK: - MusicKit backend
+
+    private var useMusicKit: Bool {
+        !musicKitDown
+    }
+
+    private var genreCache: [Int: Genre] = [:]
+
+    private func demoteMusicKit(_ error: Error) {
+        if !musicKitDown {
+            print("[MusicService] MusicKit unavailable (is the MusicKit app service enabled for this App ID?), falling back to iTunes: \(error)")
+            musicKitDown = true
         }
     }
 
-    private func appleFetch(_ pathAndQuery: String) async throws -> [String: Any] {
-        let url = URL(string: "https://api.music.apple.com/v1/catalog/\(storefront)\(pathAndQuery)")!
-        var request = URLRequest(url: url)
-        request.setValue("Bearer \(devToken)", forHTTPHeaderField: "Authorization")
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            throw URLError(.badServerResponse)
-        }
-        return (try JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
-    }
+    private static let releaseDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        return formatter
+    }()
 
-    private func mapAppleSong(_ song: [String: Any]) -> Track? {
-        guard let id = song["id"] as? String,
-              let attributes = song["attributes"] as? [String: Any],
-              let name = attributes["name"] as? String else { return nil }
-        let artwork = attributes["artwork"] as? [String: Any]
-        let artworkTemplate = artwork?["url"] as? String
-        let previews = attributes["previews"] as? [[String: Any]]
-        let relationships = song["relationships"] as? [String: Any]
-        let albums = (relationships?["albums"] as? [String: Any])?["data"] as? [[String: Any]]
-        return Track(
-            id: id,
-            name: name,
-            artistName: attributes["artistName"] as? String ?? "",
-            albumName: attributes["albumName"] as? String ?? "",
-            albumId: albums?.first?["id"] as? String,
-            artworkUrl: artworkTemplate?
-                .replacingOccurrences(of: "{w}", with: "300")
-                .replacingOccurrences(of: "{h}", with: "300"),
-            releaseDate: attributes["releaseDate"] as? String,
-            previewUrl: previews?.first?["url"] as? String,
-            externalUrl: attributes["url"] as? String,
-            genreName: (attributes["genreNames"] as? [String])?.first
+    private func mapSong(_ song: Song) -> Track {
+        Track(
+            id: song.id.rawValue,
+            name: song.title,
+            artistName: song.artistName,
+            albumName: song.albumTitle ?? "",
+            albumId: song.albums?.first?.id.rawValue,
+            artworkUrl: song.artwork?.url(width: 300, height: 300)?.absoluteString,
+            releaseDate: song.releaseDate.map { Self.releaseDateFormatter.string(from: $0) },
+            previewUrl: song.previewAssets?.first?.url?.absoluteString,
+            externalUrl: song.url?.absoluteString,
+            genreName: song.genreNames.first
         )
     }
 
-    private func appleChartTracks(genre: String?) async throws -> [Track] {
-        let genreParam = genre.flatMap { Self.genreIDs[$0] }.map { "&genre=\($0)" } ?? ""
+    private func chartGenre(for genre: String?) async throws -> Genre? {
+        guard let genre, let genreID = Self.genreIDs[genre] else { return nil }
+        if let cached = genreCache[genreID] { return cached }
+        let request = MusicCatalogResourceRequest<Genre>(matching: \.id, equalTo: MusicItemID(String(genreID)))
+        let response = try await request.response()
+        if let found = response.items.first {
+            genreCache[genreID] = found
+        }
+        return genreCache[genreID]
+    }
+
+    private func musicKitChartTracks(genre: String?) async throws -> [Track] {
+        let catalogGenre = try await chartGenre(for: genre)
         var tracks: [Track] = []
         for offset in [0, 50] {
-            let data = try await appleFetch("/charts?types=songs&limit=50&offset=\(offset)\(genreParam)")
-            let results = data["results"] as? [String: Any]
-            let songsCharts = results?["songs"] as? [[String: Any]]
-            let songs = songsCharts?.first?["data"] as? [[String: Any]] ?? []
-            tracks += songs.compactMap(mapAppleSong)
+            var request = MusicCatalogChartsRequest(genre: catalogGenre, kinds: [.mostPlayed], types: [Song.self])
+            request.limit = 50
+            request.offset = offset
+            let response = try await request.response()
+            let songs = response.songCharts.first?.items ?? []
+            tracks += songs.map(mapSong)
             if songs.count < 50 { break }
         }
         return tracks
     }
 
-    private func appleSearchTracks(term: String) async throws -> [Track] {
-        let encoded = term.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? term
+    private func musicKitSearchTracks(term: String) async throws -> [Track] {
         var tracks: [Track] = []
         for offset in [0, 25] {
-            let data = try await appleFetch("/search?types=songs&term=\(encoded)&limit=25&offset=\(offset)")
-            let results = data["results"] as? [String: Any]
-            let songs = ((results?["songs"] as? [String: Any])?["data"] as? [[String: Any]]) ?? []
-            tracks += songs.compactMap(mapAppleSong)
-            if songs.count < 25 { break }
+            var request = MusicCatalogSearchRequest(term: term, types: [Song.self])
+            request.limit = 25
+            request.offset = offset
+            let response = try await request.response()
+            tracks += response.songs.map(mapSong)
+            if response.songs.count < 25 { break }
         }
         return tracks
     }
 
-    private func appleAlbumTracks(albumId: String) async throws -> [Track] {
-        let data = try await appleFetch("/albums/\(albumId)")
-        let album = (data["data"] as? [[String: Any]])?.first
-        let relationships = album?["relationships"] as? [String: Any]
-        let songs = ((relationships?["tracks"] as? [String: Any])?["data"] as? [[String: Any]]) ?? []
-        return songs.compactMap(mapAppleSong)
+    private func musicKitAlbumTracks(albumId: String) async throws -> [Track] {
+        var request = MusicCatalogResourceRequest<Album>(matching: \.id, equalTo: MusicItemID(albumId))
+        request.properties = [.tracks]
+        let response = try await request.response()
+        guard let albumTracks = response.items.first?.tracks else { return [] }
+        return albumTracks.compactMap { item in
+            if case .song(let song) = item { return mapSong(song) }
+            return nil
+        }
+    }
+
+    private func musicKitAlbumId(forSongId songId: String) async throws -> String? {
+        var request = MusicCatalogResourceRequest<Song>(matching: \.id, equalTo: MusicItemID(songId))
+        request.properties = [.albums]
+        let response = try await request.response()
+        return response.items.first?.albums?.first?.id.rawValue
     }
 
     // MARK: - iTunes backend (no key required)
