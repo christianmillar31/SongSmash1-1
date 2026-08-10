@@ -123,9 +123,11 @@ struct Round: Identifiable {
 class PlayerManager: NSObject, ObservableObject {
     @Published var currentTrack: Track?
     @Published var isPlaying = false
+    @Published var remainingSeconds = 30
 
     private var player: AVPlayer?
     private var endObserver: NSObjectProtocol?
+    private var timeObserver: Any?
 
     override init() {
         super.init()
@@ -139,6 +141,7 @@ class PlayerManager: NSObject, ObservableObject {
             return
         }
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
+        detachTimeObserver()
         let item = AVPlayerItem(url: url)
         player = AVPlayer(playerItem: item)
         endObserver = NotificationCenter.default.addObserver(
@@ -149,6 +152,8 @@ class PlayerManager: NSObject, ObservableObject {
         player?.play()
         currentTrack = track
         isPlaying = true
+        remainingSeconds = 30
+        attachTimeObserver()
         completion(true)
     }
 
@@ -163,10 +168,32 @@ class PlayerManager: NSObject, ObservableObject {
     }
 
     func stopPlayback() {
+        detachTimeObserver()
         player?.pause()
         player = nil
         currentTrack = nil
         isPlaying = false
+        remainingSeconds = 30
+    }
+
+    // Drives the big on-screen countdown while a preview plays.
+    private func attachTimeObserver() {
+        guard let player else { return }
+        timeObserver = player.addPeriodicTimeObserver(
+            forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main
+        ) { [weak self] time in
+            guard let self, let item = self.player?.currentItem else { return }
+            let duration = item.duration.seconds
+            guard duration.isFinite, duration > 0 else { return }
+            self.remainingSeconds = max(0, Int((duration - time.seconds).rounded()))
+        }
+    }
+
+    private func detachTimeObserver() {
+        if let timeObserver, let player {
+            player.removeTimeObserver(timeObserver)
+        }
+        timeObserver = nil
     }
 }
 
@@ -368,7 +395,7 @@ struct AmbientBackground: View {
                         .frame(width: geo.size.width * 1.2, height: geo.size.width * 1.2)
                         .position(bloomPosition(index, in: geo.size))
                         .blur(radius: 110)
-                        .opacity(0.30)
+                        .opacity(0.18)
                 }
             }
         }
@@ -386,38 +413,47 @@ struct AmbientBackground: View {
 }
 
 // MARK: - Reusable Components
-struct Card: View {
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    let content: AnyView
+// Wraps chips onto as many rows as they need.
+struct FlowLayout: Layout {
+    var spacing: CGFloat = 8
 
-    init<Content: View>(@ViewBuilder content: () -> Content) {
-        self.content = AnyView(content())
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width = proposal.width ?? .infinity
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if x + size.width > width, x > 0 {
+                x = 0
+                y += rowHeight + spacing
+                rowHeight = 0
+            }
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
+        }
+        return CGSize(width: width.isFinite ? width : x, height: y + rowHeight)
     }
 
-    var body: some View {
-        content
-            .padding(DesignSystem.spacing.md)
-            .frame(maxWidth: .infinity)
-            .background(
-                RoundedRectangle(cornerRadius: DesignSystem.radius.card, style: .continuous)
-                    .fill(reduceTransparency
-                          ? AnyShapeStyle(Color(white: 0.12))
-                          : AnyShapeStyle(.ultraThinMaterial))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: DesignSystem.radius.card, style: .continuous)
-                    .strokeBorder(
-                        LinearGradient(
-                            colors: [.white.opacity(0.28), .white.opacity(0.05)],
-                            startPoint: .top, endPoint: .bottom
-                        ),
-                        lineWidth: 0.75
-                    )
-            )
-            .shadow(color: .black.opacity(0.25), radius: 14, y: 8)
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX
+        var y = bounds.minY
+        var rowHeight: CGFloat = 0
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if x + size.width > bounds.maxX, x > bounds.minX {
+                x = bounds.minX
+                y += rowHeight + spacing
+                rowHeight = 0
+            }
+            subview.place(at: CGPoint(x: x, y: y), anchor: .topLeading, proposal: ProposedViewSize(size))
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
+        }
     }
 }
 
+// Arcade-weight action button: solid green, black caps, hard under-shadow.
 struct PrimaryButton: View {
     let title: String
     let action: () -> Void
@@ -432,25 +468,27 @@ struct PrimaryButton: View {
             HStack(spacing: DesignSystem.spacing.sm) {
                 if isLoading {
                     ProgressView()
-                        .tint(DesignSystem.colors.primary)
+                        .tint(.black)
                 }
-                Text(title)
-                    .font(.headline)
+                Text(title.uppercased())
+                    .font(.headline.weight(.black))
+                    .tracking(1)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.6)
             }
-            .foregroundColor(isEnabled ? DesignSystem.colors.primary : .secondary)
+            .foregroundColor(isEnabled ? .black : .white.opacity(0.35))
             .frame(maxWidth: .infinity)
-            .padding(.vertical, DesignSystem.spacing.md)
+            .padding(.vertical, 18)
             .background(
-                RoundedRectangle(cornerRadius: DesignSystem.radius.control, style: .continuous)
-                    .fill(isEnabled
-                          ? AnyShapeStyle(DesignSystem.colors.primary.opacity(0.20))
-                          : AnyShapeStyle(Color.white.opacity(0.06)))
+                ZStack {
+                    RoundedRectangle(cornerRadius: DesignSystem.radius.control, style: .continuous)
+                        .fill(isEnabled ? Color(red: 0.10, green: 0.52, blue: 0.26) : Color.white.opacity(0.04))
+                        .offset(y: 5)
+                    RoundedRectangle(cornerRadius: DesignSystem.radius.control, style: .continuous)
+                        .fill(isEnabled ? DesignSystem.colors.primary : Color.white.opacity(0.08))
+                }
             )
-            .overlay(
-                RoundedRectangle(cornerRadius: DesignSystem.radius.control, style: .continuous)
-                    .strokeBorder(DesignSystem.colors.primary.opacity(isEnabled ? 0.45 : 0.08), lineWidth: 0.75)
-            )
-            .shadow(color: isEnabled ? DesignSystem.colors.primary.opacity(0.25) : .clear, radius: 12, y: 4)
+            .shadow(color: isEnabled ? DesignSystem.colors.primary.opacity(0.35) : .clear, radius: 16, y: 8)
         }
         .buttonStyle(PressableButtonStyle())
         .disabled(!isEnabled || isLoading)
@@ -463,60 +501,6 @@ struct PressableButtonStyle: ButtonStyle {
         configuration.label
             .scaleEffect(configuration.isPressed ? 0.96 : 1.0)
             .animation(DesignSystem.snappy, value: configuration.isPressed)
-    }
-}
-
-struct SectionHeader: View {
-    let title: String
-    let action: (() -> Void)?
-    let actionTitle: String?
-
-    init(title: String, action: (() -> Void)? = nil, actionTitle: String? = nil) {
-        self.title = title
-        self.action = action
-        self.actionTitle = actionTitle
-    }
-
-    var body: some View {
-        HStack {
-            Text(title)
-                .font(.title3.weight(.semibold))
-            Spacer()
-            if let action = action, let actionTitle = actionTitle {
-                Button(action: {
-                    Haptics.tap()
-                    action()
-                }) {
-                    Text(actionTitle)
-                        .font(.subheadline.weight(.medium))
-                        .foregroundColor(DesignSystem.colors.primary)
-                }
-            }
-        }
-    }
-}
-
-struct TeamAvatar: View {
-    let team: Team
-    var size: CGFloat = 44
-    var glow: Bool = true
-
-    var body: some View {
-        Circle()
-            .fill(
-                LinearGradient(
-                    colors: [team.color.opacity(0.85), team.color],
-                    startPoint: .top, endPoint: .bottom
-                )
-            )
-            .frame(width: size, height: size)
-            .overlay(Circle().strokeBorder(.white.opacity(0.35), lineWidth: 1))
-            .overlay(
-                Text(String(team.name.prefix(1)))
-                    .font(.system(size: size * 0.42, weight: .bold, design: .rounded))
-                    .foregroundColor(.white)
-            )
-            .shadow(color: glow ? team.color.opacity(0.55) : .clear, radius: size * 0.22, y: 3)
     }
 }
 
@@ -552,33 +536,55 @@ struct ConfettiView: View {
     }
 }
 
-// Five bars that bounce while the preview is playing and rest while paused.
-struct EqualizerView: View {
+// Full-height equalizer — on the Play screen the brand mark IS the interface.
+// Five wide bars rise from the bottom and bounce while the preview plays.
+struct StadiumEqualizer: View {
     var isPlaying: Bool
     @State private var animating = false
 
-    private let tall: [CGFloat] = [26, 40, 32, 44, 28]
-    private let short: [CGFloat] = [12, 18, 14, 20, 12]
+    private let tall: [CGFloat] = [0.62, 0.82, 1.0, 0.72, 0.55]
+    private let short: [CGFloat] = [0.30, 0.45, 0.58, 0.38, 0.26]
 
     var body: some View {
-        HStack(spacing: 5) {
-            ForEach(0..<5, id: \.self) { index in
-                RoundedRectangle(cornerRadius: 2.5)
-                    .fill(DesignSystem.colors.primary)
-                    .frame(width: 5, height: animating ? tall[index] : short[index])
-                    .animation(
-                        isPlaying
-                            ? .easeInOut(duration: 0.45).repeatForever(autoreverses: true).delay(Double(index) * 0.09)
-                            : DesignSystem.animation,
-                        value: animating
-                    )
+        GeometryReader { geo in
+            HStack(alignment: .bottom, spacing: geo.size.width * 0.045) {
+                ForEach(0..<5, id: \.self) { index in
+                    Capsule()
+                        .fill(
+                            LinearGradient(
+                                colors: [DesignSystem.colors.primary, DesignSystem.colors.primary.opacity(0.30)],
+                                startPoint: .top, endPoint: .bottom
+                            )
+                        )
+                        .frame(height: geo.size.height * (animating ? tall[index] : short[index]))
+                        .animation(
+                            isPlaying
+                                ? .easeInOut(duration: 0.5).repeatForever(autoreverses: true).delay(Double(index) * 0.11)
+                                : DesignSystem.animation,
+                            value: animating
+                        )
+                }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
         }
-        .frame(height: 44, alignment: .center)
-        .opacity(isPlaying ? 1 : 0.35)
+        .opacity(isPlaying ? 1 : 0.45)
         .onAppear { animating = isPlaying }
         .onChange(of: isPlaying) { playing in
             animating = playing
+        }
+    }
+}
+
+// Tiny static five-bar mark, used where the equalizer is a signature, not a hero.
+struct EqualizerGlyph: View {
+    private let heights: [CGFloat] = [14, 22, 30, 18, 12]
+
+    var body: some View {
+        HStack(alignment: .bottom, spacing: 4) {
+            ForEach(0..<5, id: \.self) { index in
+                Capsule()
+                    .frame(width: 6, height: heights[index])
+            }
         }
     }
 }
@@ -682,47 +688,43 @@ struct NetworkRequiredView: View {
 }
 
 // MARK: - Game Setup View
+// Stadium style: no cards — sections sit right on the dark canvas, every
+// selected state is solid green, and controls are sized for a party.
 struct GameSetupView: View {
     @EnvironmentObject var gameManager: GameManager
     @EnvironmentObject var playerManager: PlayerManager
     @State private var showingTeamSetup = UserDefaults.standard.bool(forKey: "ShowTeamSetup")
-    @State private var showingGenreSelection = UserDefaults.standard.bool(forKey: "ShowGenreSelection")
-    @State private var showingDecadeSelection = UserDefaults.standard.bool(forKey: "ShowDecadeSelection")
     @State private var editingTeam: Team?
 
     let availableGenres = ["Pop", "Rock", "Hip-Hop", "Country", "R&B", "Electronic", "Jazz", "Classical", "Indie", "Alternative"]
     let availableDecades = ["2020s", "2010s", "2000s", "1990s", "1980s", "1970s", "1960s"]
 
-    // Honest completion: teams are the only requirement; music filters are optional.
-    var setupCompletion: Double {
-        Double(min(gameManager.gameSettings.teams.count, 2)) / 2.0
-    }
-
     var body: some View {
         ScrollView {
-            VStack(spacing: DesignSystem.spacing.md) {
-                HStack {
-                    Text("New Game")
-                        .font(.largeTitle.bold())
-                    Spacer()
-                }
-                .padding(.horizontal)
-                .padding(.top, DesignSystem.spacing.md)
+            VStack(alignment: .leading, spacing: DesignSystem.spacing.lg) {
+                Text("NEW GAME")
+                    .font(.system(size: 38, weight: .black, design: .rounded))
+                    .padding(.top, DesignSystem.spacing.md)
 
-                setupProgressView
-                teamsCard
-                    .padding(.horizontal)
-                musicSelectionCard
-                    .padding(.horizontal)
-                gameSettingsCard
-                    .padding(.horizontal)
+                teamsSection
+                musicSection
+                difficultySection
+                targetScoreSection
+
                 if let error = gameManager.loadError {
-                    errorCard(error)
-                        .padding(.horizontal)
+                    errorBox(error)
                 }
-                startGameButton
+
+                PrimaryButton(
+                    title: gameManager.isLoadingTracks ? "Building your setlist…" : "Start",
+                    action: startGame,
+                    isEnabled: gameManager.gameSettings.teams.count >= 2,
+                    isLoading: gameManager.isLoadingTracks
+                )
+                .padding(.top, DesignSystem.spacing.sm)
             }
-            .padding(.vertical)
+            .padding(.horizontal, DesignSystem.spacing.lg)
+            .padding(.bottom, DesignSystem.spacing.xl)
         }
         .sheet(isPresented: $showingTeamSetup) {
             TeamSetupView()
@@ -730,223 +732,168 @@ struct GameSetupView: View {
         .sheet(item: $editingTeam) { team in
             TeamSetupView(teamToEdit: team)
         }
-        .sheet(isPresented: $showingGenreSelection) {
-            SelectionView(
-                title: "Select Genres",
-                options: availableGenres,
-                selections: $gameManager.gameSettings.genres
-            )
-        }
-        .sheet(isPresented: $showingDecadeSelection) {
-            SelectionView(
-                title: "Select Decades",
-                options: availableDecades,
-                selections: $gameManager.gameSettings.decades
-            )
-        }
     }
 
-    private var setupProgressView: some View {
-        VStack(spacing: DesignSystem.spacing.sm) {
-            HStack {
-                Text("Setup Progress")
-                    .font(.subheadline)
+    private func sectionLabel(_ title: String) -> some View {
+        Text(title)
+            .font(.footnote.weight(.heavy))
+            .tracking(2)
+            .foregroundColor(.secondary)
+    }
+
+    private var teamsSection: some View {
+        VStack(alignment: .leading, spacing: DesignSystem.spacing.sm) {
+            sectionLabel("TEAMS")
+
+            ForEach(gameManager.gameSettings.teams) { team in
+                ZStack(alignment: .trailing) {
+                    Button(action: {
+                        Haptics.tap()
+                        editingTeam = team
+                    }) {
+                        HStack {
+                            Text(team.name.uppercased())
+                                .font(.title3.weight(.black))
+                                .foregroundColor(.black)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.6)
+                            Spacer()
+                        }
+                        .padding(.horizontal, DesignSystem.spacing.md)
+                        .padding(.trailing, 44)
+                        .frame(height: 64)
+                        .background(
+                            RoundedRectangle(cornerRadius: DesignSystem.radius.control, style: .continuous)
+                                .fill(team.color)
+                        )
+                    }
+                    .buttonStyle(PressableButtonStyle())
+
+                    Button(action: {
+                        Haptics.tap()
+                        withAnimation(DesignSystem.snappy) {
+                            gameManager.gameSettings.teams.removeAll { $0.id == team.id }
+                        }
+                    }) {
+                        Image(systemName: "xmark")
+                            .font(.subheadline.weight(.black))
+                            .foregroundColor(.black.opacity(0.45))
+                            .frame(width: 44, height: 44)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(PressableButtonStyle())
+                }
+            }
+
+            Button(action: {
+                Haptics.tap()
+                showingTeamSetup = true
+            }) {
+                Text("ADD TEAM +")
+                    .font(.headline.weight(.heavy))
+                    .tracking(1)
                     .foregroundColor(.secondary)
-                Spacer()
-                Text("\(Int(setupCompletion * 100))%")
-                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 56)
+                    .background(
+                        RoundedRectangle(cornerRadius: DesignSystem.radius.control, style: .continuous)
+                            .strokeBorder(style: StrokeStyle(lineWidth: 1.5, dash: [6, 5]))
+                            .foregroundColor(.white.opacity(0.25))
+                    )
+            }
+            .buttonStyle(PressableButtonStyle())
+        }
+    }
+
+    private var musicSection: some View {
+        VStack(alignment: .leading, spacing: DesignSystem.spacing.sm) {
+            sectionLabel("MUSIC")
+
+            FlowLayout(spacing: DesignSystem.spacing.sm) {
+                ForEach(availableGenres, id: \.self) { genre in
+                    chip(genre.uppercased(), isOn: gameManager.gameSettings.genres.contains(genre)) {
+                        if let index = gameManager.gameSettings.genres.firstIndex(of: genre) {
+                            gameManager.gameSettings.genres.remove(at: index)
+                        } else {
+                            gameManager.gameSettings.genres.append(genre)
+                        }
+                    }
+                }
+                ForEach(availableDecades, id: \.self) { decade in
+                    chip(decade, isOn: gameManager.gameSettings.decades.contains(decade)) {
+                        if let index = gameManager.gameSettings.decades.firstIndex(of: decade) {
+                            gameManager.gameSettings.decades.remove(at: index)
+                        } else {
+                            gameManager.gameSettings.decades.append(decade)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func chip(_ label: String, isOn: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: {
+            Haptics.tap()
+            withAnimation(DesignSystem.snappy) { action() }
+        }) {
+            Text(label)
+                .font(.subheadline.weight(.heavy))
+                .foregroundColor(isOn ? .black : .white)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(Capsule().fill(isOn ? DesignSystem.colors.primary : Color.white.opacity(0.08)))
+        }
+        .buttonStyle(PressableButtonStyle())
+    }
+
+    private var difficultySection: some View {
+        VStack(alignment: .leading, spacing: DesignSystem.spacing.sm) {
+            sectionLabel("DIFFICULTY")
+
+            HStack(spacing: DesignSystem.spacing.sm) {
+                ForEach(Difficulty.allCases, id: \.self) { difficulty in
+                    let isOn = gameManager.gameSettings.difficulty == difficulty
+                    Button(action: {
+                        Haptics.tap()
+                        withAnimation(DesignSystem.snappy) {
+                            gameManager.gameSettings.difficulty = difficulty
+                        }
+                    }) {
+                        Text(difficulty.rawValue.uppercased())
+                            .font(.subheadline.weight(.heavy))
+                            .foregroundColor(isOn ? .black : .white)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                            .background(Capsule().fill(isOn ? DesignSystem.colors.primary : Color.white.opacity(0.08)))
+                    }
+                    .buttonStyle(PressableButtonStyle())
+                }
+            }
+        }
+    }
+
+    private var targetScoreSection: some View {
+        HStack {
+            sectionLabel("FIRST TO")
+            Spacer()
+            HStack(spacing: DesignSystem.spacing.sm) {
+                stepperButton(systemName: "minus") {
+                    if gameManager.gameSettings.targetScore > 5 {
+                        withAnimation(DesignSystem.snappy) {
+                            gameManager.gameSettings.targetScore -= 5
+                        }
+                    }
+                }
+                Text("\(gameManager.gameSettings.targetScore)")
+                    .font(.system(size: 44, weight: .black, design: .rounded))
+                    .foregroundColor(DesignSystem.colors.primary)
+                    .frame(minWidth: 76)
                     .contentTransition(.numericText())
-            }
-
-            ProgressView(value: setupCompletion)
-                .tint(DesignSystem.colors.primary)
-                .animation(DesignSystem.animation, value: setupCompletion)
-        }
-        .padding(.horizontal)
-    }
-
-    private var teamsCard: some View {
-        Card {
-            VStack(alignment: .leading, spacing: DesignSystem.spacing.md) {
-                SectionHeader(
-                    title: "Teams",
-                    action: { showingTeamSetup = true },
-                    actionTitle: "Add Team"
-                )
-
-                if gameManager.gameSettings.teams.isEmpty {
-                    HStack {
-                        Image(systemName: "person.2.fill")
-                            .foregroundColor(.secondary)
-                        Text("Add at least 2 teams to play")
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-                    }
-                    .padding(.vertical, DesignSystem.spacing.sm)
-                } else {
-                    ForEach(gameManager.gameSettings.teams) { team in
-                        HStack(spacing: DesignSystem.spacing.md) {
-                            TeamAvatar(team: team, size: 36)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(team.name)
-                                    .font(.body)
-                                Text("Tap to edit")
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
-                            }
-                            Spacer()
-                            Button(action: {
-                                Haptics.tap()
-                                withAnimation(DesignSystem.snappy) {
-                                    gameManager.gameSettings.teams.removeAll { $0.id == team.id }
-                                }
-                            }) {
-                                Image(systemName: "minus.circle.fill")
-                                    .font(.title3)
-                                    .foregroundColor(DesignSystem.colors.danger.opacity(0.85))
-                                    .frame(width: 44, height: 44)
-                            }
-                            .buttonStyle(PressableButtonStyle())
-                        }
-                        .padding(.vertical, DesignSystem.spacing.xs)
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            Haptics.tap()
-                            editingTeam = team
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private var musicSelectionCard: some View {
-        Card {
-            VStack(alignment: .leading, spacing: DesignSystem.spacing.md) {
-                SectionHeader(title: "Music Selection")
-
-                // Genres
-                VStack(alignment: .leading, spacing: DesignSystem.spacing.sm) {
-                    Button(action: {
-                        Haptics.tap()
-                        showingGenreSelection = true
-                    }) {
-                        HStack {
-                            Label("Genres", systemImage: "music.note")
-                                .font(.body)
-                            Spacer()
-                            if gameManager.gameSettings.genres.isEmpty {
-                                Text("All genres")
-                                    .font(.subheadline)
-                                    .foregroundColor(.secondary)
-                            } else {
-                                Text("\(gameManager.gameSettings.genres.count) selected")
-                                    .font(.subheadline)
-                                    .foregroundColor(DesignSystem.colors.primary)
-                            }
-                            Image(systemName: "chevron.right")
-                                .font(.footnote)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                    .foregroundColor(.primary)
-
-                    if !gameManager.gameSettings.genres.isEmpty {
-                        Text(gameManager.gameSettings.genres.joined(separator: ", "))
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                            .lineLimit(1)
-                    }
-                }
-
-                Divider()
-
-                // Decades
-                VStack(alignment: .leading, spacing: DesignSystem.spacing.sm) {
-                    Button(action: {
-                        Haptics.tap()
-                        showingDecadeSelection = true
-                    }) {
-                        HStack {
-                            Label("Decades", systemImage: "calendar")
-                                .font(.body)
-                            Spacer()
-                            if gameManager.gameSettings.decades.isEmpty {
-                                Text("All decades")
-                                    .font(.subheadline)
-                                    .foregroundColor(.secondary)
-                            } else {
-                                Text("\(gameManager.gameSettings.decades.count) selected")
-                                    .font(.subheadline)
-                                    .foregroundColor(DesignSystem.colors.primary)
-                            }
-                            Image(systemName: "chevron.right")
-                                .font(.footnote)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                    .foregroundColor(.primary)
-
-                    if !gameManager.gameSettings.decades.isEmpty {
-                        Text(gameManager.gameSettings.decades.joined(separator: ", "))
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                            .lineLimit(1)
-                    }
-                }
-            }
-        }
-    }
-
-    private var gameSettingsCard: some View {
-        Card {
-            VStack(alignment: .leading, spacing: DesignSystem.spacing.md) {
-                SectionHeader(title: "Game Settings")
-
-                // Difficulty
-                VStack(alignment: .leading, spacing: DesignSystem.spacing.sm) {
-                    Text("Difficulty")
-                        .font(.subheadline)
-                        .foregroundColor(.secondary)
-
-                    Picker("Difficulty", selection: $gameManager.gameSettings.difficulty) {
-                        ForEach(Difficulty.allCases, id: \.self) { difficulty in
-                            Text(difficulty.rawValue).tag(difficulty)
-                        }
-                    }
-                    .pickerStyle(SegmentedPickerStyle())
-                }
-
-                Divider()
-
-                // Target score — chunky ±44pt controls instead of a fiddly stepper
-                VStack(alignment: .leading, spacing: DesignSystem.spacing.sm) {
-                    Text("Playing To")
-                        .font(.subheadline)
-                        .foregroundColor(.secondary)
-
-                    HStack {
-                        Text("\(gameManager.gameSettings.targetScore) points")
-                            .font(.title.weight(.semibold))
-                            .contentTransition(.numericText())
-
-                        Spacer()
-
-                        HStack(spacing: DesignSystem.spacing.sm) {
-                            stepperButton(systemName: "minus") {
-                                if gameManager.gameSettings.targetScore > 5 {
-                                    withAnimation(DesignSystem.snappy) {
-                                        gameManager.gameSettings.targetScore -= 5
-                                    }
-                                }
-                            }
-                            stepperButton(systemName: "plus") {
-                                if gameManager.gameSettings.targetScore < 100 {
-                                    withAnimation(DesignSystem.snappy) {
-                                        gameManager.gameSettings.targetScore += 5
-                                    }
-                                }
-                            }
+                stepperButton(systemName: "plus") {
+                    if gameManager.gameSettings.targetScore < 100 {
+                        withAnimation(DesignSystem.snappy) {
+                            gameManager.gameSettings.targetScore += 5
                         }
                     }
                 }
@@ -960,53 +907,45 @@ struct GameSetupView: View {
             action()
         }) {
             Image(systemName: systemName)
-                .font(.body.weight(.semibold))
+                .font(.body.weight(.black))
                 .frame(width: 44, height: 44)
-                .background(
-                    Circle().fill(Color.white.opacity(0.08))
-                )
-                .overlay(Circle().strokeBorder(.white.opacity(0.18), lineWidth: 0.75))
+                .background(Circle().fill(Color.white.opacity(0.08)))
         }
         .buttonStyle(PressableButtonStyle())
         .foregroundColor(.primary)
     }
 
-    private func errorCard(_ message: String) -> some View {
-        Card {
-            HStack(spacing: DesignSystem.spacing.md) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundColor(DesignSystem.colors.warning)
-                Text(message)
-                    .font(.subheadline)
-                    .foregroundColor(.primary)
-            }
+    private func errorBox(_ message: String) -> some View {
+        HStack(spacing: DesignSystem.spacing.md) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundColor(.black)
+            Text(message)
+                .font(.subheadline.weight(.semibold))
+                .foregroundColor(.black)
         }
+        .padding(DesignSystem.spacing.md)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: DesignSystem.radius.control, style: .continuous)
+                .fill(DesignSystem.colors.warning)
+        )
     }
 
-    private var startGameButton: some View {
-        PrimaryButton(
-            title: gameManager.isLoadingTracks ? "Building your setlist…" : "Start Game",
-            action: {
-                Task {
-                    await gameManager.loadTracks()
-                    guard let firstTrack = gameManager.availableTracks.first else { return }
-                    gameManager.startGame()
-                    MusicService.shared.markTrackAsPlayed(firstTrack)
-                    playerManager.playSong(firstTrack) { success in
-                        if success {
-                            gameManager.nextRound(
-                                title: firstTrack.name,
-                                artist: firstTrack.artistName
-                            )
-                        }
-                    }
+    private func startGame() {
+        Task {
+            await gameManager.loadTracks()
+            guard let firstTrack = gameManager.availableTracks.first else { return }
+            gameManager.startGame()
+            MusicService.shared.markTrackAsPlayed(firstTrack)
+            playerManager.playSong(firstTrack) { success in
+                if success {
+                    gameManager.nextRound(
+                        title: firstTrack.name,
+                        artist: firstTrack.artistName
+                    )
                 }
-            },
-            isEnabled: gameManager.gameSettings.teams.count >= 2,
-            isLoading: gameManager.isLoadingTracks
-        )
-        .padding(.horizontal)
-        .padding(.top, DesignSystem.spacing.md)
+            }
+        }
     }
 }
 
@@ -1046,8 +985,9 @@ struct TeamSetupView: View {
                 VStack(spacing: DesignSystem.spacing.lg) {
                 // Team Name Input
                 VStack(alignment: .leading, spacing: DesignSystem.spacing.sm) {
-                    Text("Team Name")
-                        .font(.subheadline)
+                    Text("TEAM NAME")
+                        .font(.footnote.weight(.heavy))
+                        .tracking(2)
                         .foregroundColor(.secondary)
 
                     TextField("Enter team name", text: $teamName)
@@ -1068,8 +1008,9 @@ struct TeamSetupView: View {
 
                 // Color Selection
                 VStack(alignment: .leading, spacing: DesignSystem.spacing.sm) {
-                    Text("Team Color")
-                        .font(.subheadline)
+                    Text("TEAM COLOR")
+                        .font(.footnote.weight(.heavy))
+                        .tracking(2)
                         .foregroundColor(.secondary)
 
                     LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 5), spacing: DesignSystem.spacing.md) {
@@ -1115,7 +1056,7 @@ struct TeamSetupView: View {
                 }
             }
         }
-        .presentationBackground(.ultraThinMaterial)
+        .presentationBackground(Color(red: 0.07, green: 0.07, blue: 0.09))
         .presentationDetents([.medium, .large])
     }
 
@@ -1133,77 +1074,10 @@ struct TeamSetupView: View {
     }
 }
 
-// MARK: - Selection View
-struct SelectionView: View {
-    let title: String
-    let options: [String]
-    @Binding var selections: [String]
-    @Environment(\.dismiss) var dismiss
-
-    var body: some View {
-        NavigationView {
-            VStack(spacing: 0) {
-                if !selections.isEmpty {
-                    HStack {
-                        Text("\(selections.count) selected")
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-                        Spacer()
-                        Button("Clear All") {
-                            Haptics.tap()
-                            selections.removeAll()
-                        }
-                        .font(.subheadline)
-                        .foregroundColor(DesignSystem.colors.danger)
-                    }
-                    .padding()
-                }
-
-                List {
-                    ForEach(options, id: \.self) { option in
-                        HStack {
-                            Text(option)
-                                .font(.body)
-                            Spacer()
-                            if selections.contains(option) {
-                                Image(systemName: "checkmark.circle.fill")
-                                    .foregroundColor(DesignSystem.colors.primary)
-                                    .font(.title3)
-                            }
-                        }
-                        .contentShape(Rectangle())
-                        .listRowBackground(Color.white.opacity(0.06))
-                        .onTapGesture {
-                            Haptics.tap()
-                            withAnimation(DesignSystem.snappy) {
-                                if selections.contains(option) {
-                                    selections.removeAll { $0 == option }
-                                } else {
-                                    selections.append(option)
-                                }
-                            }
-                        }
-                    }
-                }
-                .listStyle(InsetGroupedListStyle())
-                .scrollContentBackground(.hidden)
-            }
-            .navigationTitle(title)
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("Done") { dismiss() }
-                        .font(.body.weight(.semibold))
-                }
-            }
-        }
-        .presentationBackground(.ultraThinMaterial)
-    }
-}
-
 // MARK: - Game Play View
-// One focal point (the mystery card), a compact score strip, and a single
-// scoring model: reveal, tap teams to cycle points, next song.
+// Stadium: the Play screen IS the equalizer, with a split-color scoreboard
+// and one giant countdown. Reveal swaps to the answer + half-screen scoring
+// slabs. Same flow as before: reveal → tap teams to cycle points → next song.
 struct GamePlayView: View {
     @EnvironmentObject var playerManager: PlayerManager
     @EnvironmentObject var gameManager: GameManager
@@ -1212,27 +1086,12 @@ struct GamePlayView: View {
     @State private var showRoundBanner = false
 
     var body: some View {
-        VStack(spacing: 0) {
-            topBar
-
-            ScrollView {
-                VStack(spacing: DesignSystem.spacing.md) {
-                    scoreStrip
-                        .padding(.horizontal)
-
-                    if playerManager.currentTrack != nil {
-                        heroCard
-                            .padding(.horizontal)
-                    }
-
-                    actionSection
-                        .padding(.horizontal)
-                }
-                .padding(.top, DesignSystem.spacing.sm)
-                .padding(.bottom, DesignSystem.spacing.xl)
+        Group {
+            if gameManager.showAnswer {
+                revealView
+            } else {
+                mysteryView
             }
-
-            playbackDock
         }
         .overlay { roundBanner }
         .confirmationDialog("End this game?", isPresented: $showEndGameConfirm, titleVisibility: .visible) {
@@ -1248,242 +1107,266 @@ struct GamePlayView: View {
         .onChange(of: gameManager.currentRoundNumber) { _ in
             flashRoundBanner()
         }
-    }
-
-    // MARK: Top bar
-    private var topBar: some View {
-        VStack(spacing: DesignSystem.spacing.sm) {
-            HStack {
-                Text("Round \(gameManager.currentRoundNumber) · First to \(gameManager.gameSettings.targetScore)")
-                    .font(.headline)
-                    .contentTransition(.numericText())
-                Spacer()
-                Button(action: { showEndGameConfirm = true }) {
-                    Text("End Game")
-                        .font(.subheadline)
-                        .foregroundColor(DesignSystem.colors.danger)
-                        .padding(.vertical, 6)
-                        .padding(.horizontal, 10)
-                }
-            }
-
-            ProgressView(value: gameManager.progress)
-                .tint(DesignSystem.colors.primary)
-                .animation(DesignSystem.animation, value: gameManager.progress)
-        }
-        .padding(.horizontal)
-        .padding(.vertical, DesignSystem.spacing.sm)
-    }
-
-    // MARK: Score strip — compact, glanceable, out of the way
-    private var scoreStrip: some View {
-        HStack(spacing: DesignSystem.spacing.md) {
-            ForEach(gameManager.gameSettings.teams) { team in
-                HStack(spacing: DesignSystem.spacing.sm) {
-                    TeamAvatar(team: team, size: 28, glow: false)
-                    Text(team.name)
-                        .font(.subheadline)
-                        .lineLimit(1)
-                    Text("\(team.score)")
-                        .font(.headline)
-                        .contentTransition(.numericText())
-                        .foregroundColor(team.color)
-                }
-                .frame(maxWidth: .infinity)
-            }
-        }
-        .padding(.vertical, DesignSystem.spacing.sm)
-        .padding(.horizontal, DesignSystem.spacing.md)
-        .background(
-            Capsule().fill(.ultraThinMaterial)
-        )
-        .overlay(
-            Capsule().strokeBorder(.white.opacity(0.15), lineWidth: 0.75)
-        )
-    }
-
-    // MARK: Hero card — the mystery is the star of the screen
-    private var heroCard: some View {
-        Card {
-            VStack(spacing: DesignSystem.spacing.md) {
-                EqualizerView(isPlaying: playerManager.isPlaying)
-
-                Text("NOW PLAYING")
-                    .font(.caption.weight(.semibold))
-                    .tracking(2)
-                    .foregroundColor(.secondary)
-
-                if gameManager.showAnswer, let track = playerManager.currentTrack {
-                    VStack(spacing: DesignSystem.spacing.sm) {
-                        Text(track.name)
-                            .font(.system(size: 34, weight: .bold, design: .rounded))
-                            .multilineTextAlignment(.center)
-                            .minimumScaleFactor(0.6)
-                        Text(track.artistName)
-                            .font(.title3)
-                            .foregroundColor(.secondary)
-                            .multilineTextAlignment(.center)
-                        if let year = track.releaseYear {
-                            Text(String(year))
-                                .font(.caption.weight(.semibold))
-                                .padding(.vertical, 4)
-                                .padding(.horizontal, 10)
-                                .background(Capsule().fill(Color.white.opacity(0.1)))
-                        }
-                    }
-                    .transition(.scale(scale: 0.8).combined(with: .opacity))
-                } else {
-                    VStack(spacing: DesignSystem.spacing.sm) {
-                        Text("?????")
-                            .font(.system(size: 64, weight: .heavy, design: .rounded))
-                            .foregroundColor(.white.opacity(0.35))
-                        Text("Listen carefully!")
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-                    }
-                    .transition(.opacity)
-                }
-            }
-            .padding(.vertical, DesignSystem.spacing.md)
-        }
         .animation(DesignSystem.animation, value: gameManager.showAnswer)
     }
 
-    // MARK: Actions — reveal, then score inline, then next song
-    private var actionSection: some View {
-        VStack(spacing: DesignSystem.spacing.md) {
-            if !gameManager.showAnswer {
-                Button(action: {
+    // MARK: Mystery — full-height equalizer with the countdown on top
+    private var mysteryView: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: DesignSystem.spacing.sm) {
+                scoreBar
+                endGameButton
+            }
+            .padding(.horizontal)
+            .padding(.top, DesignSystem.spacing.sm)
+
+            ZStack {
+                StadiumEqualizer(isPlaying: playerManager.isPlaying)
+                    .padding(.horizontal, DesignSystem.spacing.lg)
+                    .padding(.top, DesignSystem.spacing.md)
+
+                VStack(spacing: DesignSystem.spacing.md) {
+                    Text(countdown)
+                        .font(.system(size: 88, weight: .black, design: .rounded))
+                        .foregroundColor(.white)
+                        .contentTransition(.numericText())
+                        .padding(.top, DesignSystem.spacing.lg)
+
+                    Text("ROUND \(gameManager.currentRoundNumber) · FIRST TO \(gameManager.gameSettings.targetScore)")
+                        .font(.footnote.weight(.heavy))
+                        .tracking(1)
+                        .foregroundColor(.white.opacity(0.85))
+                        .padding(.vertical, 8)
+                        .padding(.horizontal, 14)
+                        .background(Capsule().fill(Color.black.opacity(0.45)))
+
+                    Spacer()
+                }
+            }
+
+            HStack(spacing: DesignSystem.spacing.md) {
+                pausePlayButton
+
+                PrimaryButton(title: "Reveal", action: {
                     Haptics.reveal()
                     withAnimation(DesignSystem.animation) {
                         gameManager.showAnswer = true
                     }
-                }) {
-                    HStack {
-                        Image(systemName: "eye.fill")
-                        Text("Reveal Answer")
+                })
+            }
+            .padding(.horizontal)
+            .padding(.bottom, DesignSystem.spacing.sm)
+        }
+    }
+
+    private var countdown: String {
+        let seconds = max(0, playerManager.remainingSeconds)
+        return String(format: "%d:%02d", seconds / 60, seconds % 60)
+    }
+
+    // MARK: Reveal — the answer + half-screen scoring slabs
+    private var revealView: some View {
+        VStack(spacing: DesignSystem.spacing.md) {
+            HStack {
+                Spacer()
+                Button(action: advanceToNextSong) {
+                    HStack(spacing: 6) {
+                        Text("NEXT")
+                            .font(.subheadline.weight(.heavy))
+                            .tracking(1)
+                        Image(systemName: "arrow.right")
+                            .font(.subheadline.weight(.black))
                     }
-                    .font(.headline)
-                    .foregroundColor(DesignSystem.colors.warning)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, DesignSystem.spacing.md)
-                    .background(
-                        RoundedRectangle(cornerRadius: DesignSystem.radius.control, style: .continuous)
-                            .fill(DesignSystem.colors.warning.opacity(0.16))
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: DesignSystem.radius.control, style: .continuous)
-                            .strokeBorder(DesignSystem.colors.warning.opacity(0.4), lineWidth: 0.75)
-                    )
+                    .foregroundColor(.white)
+                    .padding(.vertical, 12)
+                    .padding(.horizontal, 18)
+                    .background(Capsule().fill(Color.white.opacity(0.1)))
                 }
                 .buttonStyle(PressableButtonStyle())
-            } else {
-                scoringChips
-
-                PrimaryButton(
-                    title: "Next Song",
-                    action: advanceToNextSong
-                )
             }
-        }
-    }
+            .padding(.horizontal)
+            .padding(.top, DesignSystem.spacing.sm)
 
-    // One scoring model: tap a team to cycle 0 → 1 → 2 points.
-    private var scoringChips: some View {
-        VStack(spacing: DesignSystem.spacing.sm) {
-            Text("Tap a team once = artist or title (+1) · twice = both (+2)")
-                .font(.caption)
+            Spacer(minLength: 0)
+
+            answerBlock
+
+            Spacer(minLength: 0)
+
+            Text("TAP ONCE +1 · TWICE +2")
+                .font(.caption2.weight(.heavy))
+                .tracking(2)
                 .foregroundColor(.secondary)
 
-            HStack(spacing: DesignSystem.spacing.md) {
-                ForEach(gameManager.gameSettings.teams) { team in
-                    let points = roundScores[team.id] ?? 0
+            scoringSlabs
+                .padding(.horizontal)
+                .padding(.bottom, DesignSystem.spacing.md)
+        }
+    }
 
-                    Button(action: {
-                        Haptics.score()
-                        withAnimation(DesignSystem.snappy) {
-                            roundScores[team.id] = (points + 1) % 3
-                        }
-                    }) {
-                        VStack(spacing: DesignSystem.spacing.xs) {
-                            ZStack {
-                                TeamAvatar(team: team, size: 62, glow: points > 0)
-                                if points > 0 {
-                                    Text("+\(points)")
-                                        .font(.caption.weight(.heavy))
-                                        .foregroundColor(.black)
-                                        .frame(width: 26, height: 26)
-                                        .background(Circle().fill(DesignSystem.colors.primary))
-                                        .offset(x: 24, y: -22)
-                                        .transition(.scale.combined(with: .opacity))
-                                }
-                            }
-                            Text(team.name)
-                                .font(.caption)
-                                .foregroundColor(.primary)
-                                .lineLimit(1)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, DesignSystem.spacing.sm)
-                        .background(
-                            RoundedRectangle(cornerRadius: DesignSystem.radius.control, style: .continuous)
-                                .fill(points > 0 ? AnyShapeStyle(team.color.opacity(0.18)) : AnyShapeStyle(Color.white.opacity(0.05)))
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: DesignSystem.radius.control, style: .continuous)
-                                .strokeBorder(points > 0 ? team.color.opacity(0.6) : .white.opacity(0.12), lineWidth: 1)
-                        )
-                    }
-                    .buttonStyle(PressableButtonStyle())
+    private var answerBlock: some View {
+        ZStack {
+            // Ghost year — era drama behind the reveal, borrowed from the
+            // Poster direction.
+            if let year = playerManager.currentTrack?.releaseYear {
+                Text(String(year))
+                    .font(.system(size: 190, weight: .black, design: .rounded))
+                    .foregroundColor(.white.opacity(0.05))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.5)
+            }
+
+            VStack(spacing: DesignSystem.spacing.sm) {
+                Text("THAT WAS")
+                    .font(.footnote.weight(.heavy))
+                    .tracking(3)
+                    .foregroundColor(DesignSystem.colors.primary)
+
+                Text((playerManager.currentTrack?.name ?? "Mystery Song").uppercased())
+                    .font(.system(size: 40, weight: .black, design: .rounded))
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.4)
+
+                if let track = playerManager.currentTrack {
+                    Text(revealSubtitle(for: track))
+                        .font(.subheadline.weight(.heavy))
+                        .tracking(1)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
                 }
+            }
+            .padding(.horizontal, DesignSystem.spacing.lg)
+        }
+    }
+
+    private func revealSubtitle(for track: Track) -> String {
+        var subtitle = track.artistName.uppercased()
+        if let year = track.releaseYear {
+            subtitle += " · \(year)"
+        }
+        return subtitle
+    }
+
+    // Tap a slab to cycle 0 → +1 → +2 → 0; the slab shows the running total.
+    private var scoringSlabs: some View {
+        let teams = gameManager.gameSettings.teams
+        let columnCount = teams.count <= 3 ? max(teams.count, 1) : (teams.count == 4 ? 2 : 3)
+        let columns = Array(repeating: GridItem(.flexible(), spacing: DesignSystem.spacing.md), count: columnCount)
+        return LazyVGrid(columns: columns, spacing: DesignSystem.spacing.md) {
+            ForEach(teams) { team in
+                scoringSlab(team)
             }
         }
     }
 
-    // MARK: Playback dock
-    private var playbackDock: some View {
-        HStack {
-            Spacer()
-            Button(action: {
-                Haptics.tap()
-                if gameManager.gameState == .playing {
-                    playerManager.pausePlayback()
-                    gameManager.gameState = .paused
-                } else {
-                    playerManager.resumePlayback()
-                    gameManager.gameState = .playing
-                }
-            }) {
-                Image(systemName: gameManager.gameState == .playing ? "pause.fill" : "play.fill")
-                    .font(.title2)
-                    .foregroundColor(.white)
-                    .frame(width: 62, height: 62)
-                    .background(Circle().fill(.ultraThinMaterial))
-                    .overlay(Circle().strokeBorder(.white.opacity(0.25), lineWidth: 0.75))
-                    .shadow(color: .black.opacity(0.3), radius: 10, y: 5)
+    private func scoringSlab(_ team: Team) -> some View {
+        let points = roundScores[team.id] ?? 0
+        return Button(action: {
+            Haptics.score()
+            withAnimation(DesignSystem.snappy) {
+                roundScores[team.id] = (points + 1) % 3
             }
-            .buttonStyle(PressableButtonStyle())
-            Spacer()
+        }) {
+            VStack(spacing: DesignSystem.spacing.xs) {
+                Text(team.name.uppercased())
+                    .font(.footnote.weight(.heavy))
+                    .foregroundColor(.black.opacity(0.75))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.5)
+
+                Text("\(team.score)")
+                    .font(.system(size: 64, weight: .black, design: .rounded))
+                    .foregroundColor(.black)
+                    .contentTransition(.numericText())
+
+                Text(points > 0 ? "+\(points)" : "+1 · +2")
+                    .font(.caption.weight(.heavy))
+                    .foregroundColor(points > 0 ? .white : .black.opacity(0.45))
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, DesignSystem.spacing.md)
+            .background(
+                RoundedRectangle(cornerRadius: DesignSystem.radius.card, style: .continuous)
+                    .fill(team.color)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: DesignSystem.radius.card, style: .continuous)
+                    .strokeBorder(.white, lineWidth: points > 0 ? 4 : 0)
+            )
+            .shadow(color: team.color.opacity(points > 0 ? 0.6 : 0.25), radius: 12, y: 6)
         }
-        .padding(.vertical, DesignSystem.spacing.sm)
+        .buttonStyle(PressableButtonStyle())
+        .animation(DesignSystem.snappy, value: points)
+    }
+
+    // MARK: Scoreboard — a split-color bar anyone can read across the table
+    private var scoreBar: some View {
+        HStack(spacing: 2) {
+            ForEach(gameManager.gameSettings.teams) { team in
+                HStack(spacing: 6) {
+                    Text(team.name.uppercased())
+                        .font(.caption.weight(.heavy))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.4)
+                    Text("\(team.score)")
+                        .font(.title3.weight(.black))
+                        .contentTransition(.numericText())
+                }
+                .foregroundColor(.black)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 10)
+                .background(team.color)
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: DesignSystem.radius.chip, style: .continuous))
+    }
+
+    private var endGameButton: some View {
+        Button(action: { showEndGameConfirm = true }) {
+            Image(systemName: "xmark")
+                .font(.subheadline.weight(.black))
+                .foregroundColor(.white.opacity(0.7))
+                .frame(width: 44, height: 44)
+                .background(Circle().fill(Color.white.opacity(0.08)))
+        }
+        .buttonStyle(PressableButtonStyle())
+    }
+
+    private var pausePlayButton: some View {
+        Button(action: {
+            Haptics.tap()
+            if gameManager.gameState == .playing {
+                playerManager.pausePlayback()
+                gameManager.gameState = .paused
+            } else {
+                playerManager.resumePlayback()
+                gameManager.gameState = .playing
+            }
+        }) {
+            Image(systemName: gameManager.gameState == .playing ? "pause.fill" : "play.fill")
+                .font(.title3.weight(.black))
+                .foregroundColor(.white)
+                .frame(width: 58, height: 58)
+                .background(Circle().fill(Color.white.opacity(0.1)))
+        }
+        .buttonStyle(PressableButtonStyle())
     }
 
     // MARK: Round banner
     private var roundBanner: some View {
         Group {
             if showRoundBanner {
-                Text("Round \(gameManager.currentRoundNumber)")
-                    .font(.system(size: 44, weight: .heavy, design: .rounded))
+                Text("ROUND \(gameManager.currentRoundNumber)")
+                    .font(.system(size: 40, weight: .black, design: .rounded))
+                    .foregroundColor(.black)
                     .padding(.vertical, DesignSystem.spacing.md)
                     .padding(.horizontal, DesignSystem.spacing.xl)
                     .background(
                         RoundedRectangle(cornerRadius: DesignSystem.radius.card, style: .continuous)
-                            .fill(.ultraThinMaterial)
+                            .fill(DesignSystem.colors.primary)
                     )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: DesignSystem.radius.card, style: .continuous)
-                            .strokeBorder(.white.opacity(0.25), lineWidth: 0.75)
-                    )
+                    .shadow(color: DesignSystem.colors.primary.opacity(0.4), radius: 20, y: 8)
                     .transition(.scale(scale: 0.6).combined(with: .opacity))
             }
         }
@@ -1542,10 +1425,12 @@ struct GamePlayView: View {
 }
 
 // MARK: - Game Finished View
+// Stadium winner moment: the whole screen floods the winning team's color.
+// No crowns — the color and the giant score ARE the celebration.
 struct GameFinishedView: View {
     @EnvironmentObject var gameManager: GameManager
     @EnvironmentObject var playerManager: PlayerManager
-    @State private var crownScale = 0.4
+    @State private var scoreScale = 0.5
 
     var sortedTeams: [Team] {
         gameManager.gameSettings.teams.sorted(by: { $0.score > $1.score })
@@ -1553,113 +1438,114 @@ struct GameFinishedView: View {
 
     var body: some View {
         ZStack {
-            VStack(spacing: DesignSystem.spacing.lg) {
+            (gameManager.winner?.color ?? DesignSystem.colors.primary)
+                .ignoresSafeArea()
+
+            VStack(spacing: DesignSystem.spacing.md) {
+                Spacer()
+
+                Text("WINNERS")
+                    .font(.caption.weight(.heavy))
+                    .tracking(3)
+                    .foregroundColor(.white)
+                    .padding(.vertical, 8)
+                    .padding(.horizontal, 16)
+                    .background(Capsule().fill(.black))
+
                 if let winner = gameManager.winner {
-                    VStack(spacing: DesignSystem.spacing.md) {
-                        Text("Winner!")
-                            .font(.system(size: 44, weight: .heavy, design: .rounded))
+                    Text(winner.name.uppercased())
+                        .font(.system(size: 44, weight: .black, design: .rounded))
+                        .foregroundColor(.black)
+                        .multilineTextAlignment(.center)
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.5)
+                        .padding(.horizontal, DesignSystem.spacing.lg)
 
-                        ZStack {
-                            Circle()
-                                .fill(winner.color)
-                                .frame(width: 130, height: 130)
-                                .shadow(color: winner.color.opacity(0.65), radius: 30, y: 10)
-                            Text("👑")
-                                .font(.system(size: 62))
-                        }
-                        .scaleEffect(crownScale)
-
-                        VStack(spacing: DesignSystem.spacing.xs) {
-                            Text(winner.name)
-                                .font(.largeTitle.bold())
-                            Text("\(winner.score) points")
-                                .font(.title3)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                    .padding(.top, DesignSystem.spacing.xl)
+                    Text("\(winner.score)")
+                        .font(.system(size: 168, weight: .black, design: .rounded))
+                        .foregroundColor(.black)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.4)
+                        .scaleEffect(scoreScale)
                 }
 
-                Card {
-                    VStack(alignment: .leading, spacing: DesignSystem.spacing.md) {
-                        Text("Final Scores")
-                            .font(.title3.weight(.semibold))
+                EqualizerGlyph()
+                    .foregroundColor(.white)
 
-                        ForEach(Array(sortedTeams.enumerated()), id: \.element.id) { index, team in
-                            HStack(spacing: DesignSystem.spacing.md) {
-                                Text("\(index + 1)")
-                                    .font(.headline)
-                                    .foregroundColor(index == 0 ? .yellow : .secondary)
-                                    .frame(width: 28)
-
-                                TeamAvatar(team: team, size: 34, glow: index == 0)
-
-                                Text(team.name)
-                                    .font(.body)
-
-                                Spacer()
-
-                                Text("\(team.score)")
-                                    .font(.title3.bold())
-                                    .foregroundColor(team.color)
-                            }
-                            .padding(.vertical, DesignSystem.spacing.xs)
-
-                            if index < sortedTeams.count - 1 {
-                                Divider()
-                            }
-                        }
+                VStack(spacing: DesignSystem.spacing.xs) {
+                    ForEach(Array(sortedTeams.dropFirst())) { team in
+                        Text("\(team.name.uppercased()) · \(team.score)")
+                            .font(.subheadline.weight(.heavy))
+                            .tracking(1)
+                            .foregroundColor(.black.opacity(0.55))
                     }
                 }
-                .padding(.horizontal)
 
                 Spacer()
 
-                VStack(spacing: DesignSystem.spacing.md) {
-                    PrimaryButton(
-                        title: "Play Again",
-                        action: {
-                            Task {
-                                await gameManager.loadTracks()
-                                guard let firstTrack = gameManager.availableTracks.first else { return }
-                                gameManager.startGame()
-                                MusicService.shared.markTrackAsPlayed(firstTrack)
-                                playerManager.playSong(firstTrack) { success in
-                                    if success {
-                                        gameManager.nextRound(title: firstTrack.name, artist: firstTrack.artistName)
-                                    }
-                                }
-                            }
-                        },
-                        isLoading: gameManager.isLoadingTracks
-                    )
+                VStack(spacing: DesignSystem.spacing.sm) {
+                    Button(action: rematch) {
+                        Text(gameManager.isLoadingTracks ? "BUILDING YOUR SETLIST…" : "REMATCH")
+                            .font(.headline.weight(.black))
+                            .tracking(1)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.6)
+                            .foregroundColor(.white)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 18)
+                            .background(
+                                RoundedRectangle(cornerRadius: DesignSystem.radius.control, style: .continuous)
+                                    .fill(.black)
+                            )
+                    }
+                    .buttonStyle(PressableButtonStyle())
+                    .disabled(gameManager.isLoadingTracks)
 
                     Button(action: {
+                        Haptics.tap()
                         playerManager.stopPlayback()
                         gameManager.resetScores()
                         gameManager.gameState = .setup
                     }) {
-                        Text("New Game")
-                            .font(.body)
-                            .foregroundColor(DesignSystem.colors.primary)
+                        Text("NEW GAME")
+                            .font(.headline.weight(.black))
+                            .tracking(1)
+                            .foregroundColor(.black)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 16)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: DesignSystem.radius.control, style: .continuous)
+                                    .strokeBorder(.black.opacity(0.6), lineWidth: 2)
+                            )
                     }
+                    .buttonStyle(PressableButtonStyle())
                 }
-                .padding(.horizontal)
-                .padding(.bottom, DesignSystem.spacing.xl)
+                .padding(.horizontal, DesignSystem.spacing.lg)
+                .padding(.bottom, DesignSystem.spacing.lg)
             }
 
-            ConfettiView(colors: confettiColors)
+            ConfettiView(colors: [.white, .black, .white.opacity(0.7)])
         }
         .onAppear {
             Haptics.celebrate()
             withAnimation(.spring(response: 0.6, dampingFraction: 0.55).delay(0.15)) {
-                crownScale = 1.0
+                scoreScale = 1.0
             }
         }
     }
 
-    private var confettiColors: [Color] {
-        let teamColors = gameManager.gameSettings.teams.map(\.color)
-        return teamColors.isEmpty ? [.blue, .pink, .yellow, DesignSystem.colors.primary] : teamColors + [.yellow, .white]
+    private func rematch() {
+        Haptics.tap()
+        Task {
+            await gameManager.loadTracks()
+            guard let firstTrack = gameManager.availableTracks.first else { return }
+            gameManager.startGame()
+            MusicService.shared.markTrackAsPlayed(firstTrack)
+            playerManager.playSong(firstTrack) { success in
+                if success {
+                    gameManager.nextRound(title: firstTrack.name, artist: firstTrack.artistName)
+                }
+            }
+        }
     }
 }
