@@ -75,9 +75,15 @@ final class MusicService {
         "Electronic": ["electronic", "dance"],
     ]
 
+    // Order matches GameSetupView's availableDecades (the view references this).
+    static let allDecades = ["2020s", "2010s", "2000s", "1990s", "1980s", "1970s", "1960s"]
+
     private let easyChartCutoff = 40
     private let deepCutSources = 6
     private let deepCutsPerAlbum = 2
+    // Decade searches per genre when the player picked no decades; bounded so
+    // a many-genre selection stays under the iTunes fallback's ~20 req/min.
+    private let allErasSearchBudget = 8
 
     // MARK: - Public API
 
@@ -102,8 +108,14 @@ final class MusicService {
                 pool += filterByDecades(cuts, decades: decades)
             }
 
-            // Charts skew recent, so decades need their own search pass.
-            for decade in decades {
+            // Charts skew recent, so decades need their own search pass. With
+            // no decades picked, sweep them all anyway — otherwise "all music"
+            // is just today's chart, which is almost entirely the last two
+            // years. Sampled per genre to respect the search budget.
+            let searchDecades = decades.isEmpty
+                ? Array(Self.allDecades.shuffled().prefix(max(2, allErasSearchBudget / genreKeys.count)))
+                : decades
+            for decade in searchDecades {
                 let found = await decadeTracks(decade: decade, genre: genre)
                 pool += found.filter { wantedTiers(for: difficulty).contains($0.tier) }
             }
@@ -292,6 +304,17 @@ final class MusicService {
     /// simply leaves the iTunes fallback serving.
     private func ensureMusicKitAuthorization() async {
         guard !musicKitDown, MusicAuthorization.currentStatus == .notDetermined else { return }
+        // Apple's dialog is all-or-nothing ("music and video activity", "media
+        // library") even though we only read the public catalog. Don't show it
+        // unless MusicKit can actually serve: while the MusicKit app service
+        // isn't enabled for this App ID, the developer token fails and every
+        // request would 401 into the iTunes fallback anyway.
+        do {
+            _ = try await DefaultMusicTokenProvider().developerToken(options: [])
+        } catch {
+            demoteMusicKit(error)
+            return
+        }
         let status = await MusicAuthorization.request()
         if status != .authorized {
             print("[MusicService] Apple Music access not granted (\(status)); using iTunes catalog")

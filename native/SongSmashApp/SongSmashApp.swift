@@ -1091,7 +1091,7 @@ struct MusicSelectionSheet: View {
     @Environment(\.dismiss) var dismiss
 
     let availableGenres = ["Pop", "Rock", "Hip-Hop", "Country", "R&B", "Electronic", "Jazz", "Classical", "Indie", "Alternative"]
-    let availableDecades = ["2020s", "2010s", "2000s", "1990s", "1980s", "1970s", "1960s"]
+    let availableDecades = MusicService.allDecades
 
     var body: some View {
         NavigationView {
