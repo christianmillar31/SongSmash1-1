@@ -694,10 +694,8 @@ struct GameSetupView: View {
     @EnvironmentObject var gameManager: GameManager
     @EnvironmentObject var playerManager: PlayerManager
     @State private var showingTeamSetup = UserDefaults.standard.bool(forKey: "ShowTeamSetup")
+    @State private var showingMusicSheet = false
     @State private var editingTeam: Team?
-
-    let availableGenres = ["Pop", "Rock", "Hip-Hop", "Country", "R&B", "Electronic", "Jazz", "Classical", "Indie", "Alternative"]
-    let availableDecades = ["2020s", "2010s", "2000s", "1990s", "1980s", "1970s", "1960s"]
 
     var body: some View {
         ScrollView {
@@ -731,6 +729,9 @@ struct GameSetupView: View {
         }
         .sheet(item: $editingTeam) { team in
             TeamSetupView(teamToEdit: team)
+        }
+        .sheet(isPresented: $showingMusicSheet) {
+            MusicSelectionSheet()
         }
     }
 
@@ -805,46 +806,49 @@ struct GameSetupView: View {
         }
     }
 
+    // The mix reads as one line ("ROCK · 1980s"); the chips live in a sheet.
     private var musicSection: some View {
         VStack(alignment: .leading, spacing: DesignSystem.spacing.sm) {
             sectionLabel("MUSIC")
 
-            FlowLayout(spacing: DesignSystem.spacing.sm) {
-                ForEach(availableGenres, id: \.self) { genre in
-                    chip(genre.uppercased(), isOn: gameManager.gameSettings.genres.contains(genre)) {
-                        if let index = gameManager.gameSettings.genres.firstIndex(of: genre) {
-                            gameManager.gameSettings.genres.remove(at: index)
-                        } else {
-                            gameManager.gameSettings.genres.append(genre)
-                        }
-                    }
+            Button(action: {
+                Haptics.tap()
+                showingMusicSheet = true
+            }) {
+                HStack {
+                    Text(musicSummary)
+                        .font(.headline.weight(.heavy))
+                        .tracking(1)
+                        .foregroundColor(hasMusicFilters ? DesignSystem.colors.primary : .white)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.6)
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.subheadline.weight(.black))
+                        .foregroundColor(.secondary)
                 }
-                ForEach(availableDecades, id: \.self) { decade in
-                    chip(decade, isOn: gameManager.gameSettings.decades.contains(decade)) {
-                        if let index = gameManager.gameSettings.decades.firstIndex(of: decade) {
-                            gameManager.gameSettings.decades.remove(at: index)
-                        } else {
-                            gameManager.gameSettings.decades.append(decade)
-                        }
-                    }
-                }
+                .padding(.horizontal, DesignSystem.spacing.md)
+                .frame(height: 56)
+                .background(
+                    RoundedRectangle(cornerRadius: DesignSystem.radius.control, style: .continuous)
+                        .fill(Color.white.opacity(0.08))
+                )
             }
+            .buttonStyle(PressableButtonStyle())
         }
     }
 
-    private func chip(_ label: String, isOn: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: {
-            Haptics.tap()
-            withAnimation(DesignSystem.snappy) { action() }
-        }) {
-            Text(label)
-                .font(.subheadline.weight(.heavy))
-                .foregroundColor(isOn ? .black : .white)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-                .background(Capsule().fill(isOn ? DesignSystem.colors.primary : Color.white.opacity(0.08)))
+    private var hasMusicFilters: Bool {
+        !gameManager.gameSettings.genres.isEmpty || !gameManager.gameSettings.decades.isEmpty
+    }
+
+    private var musicSummary: String {
+        let items = gameManager.gameSettings.genres.map { $0.uppercased() } + gameManager.gameSettings.decades
+        if items.isEmpty { return "ALL MUSIC" }
+        if items.count > 4 {
+            return items.prefix(3).joined(separator: " · ") + " +\(items.count - 3)"
         }
-        .buttonStyle(PressableButtonStyle())
+        return items.joined(separator: " · ")
     }
 
     private var difficultySection: some View {
@@ -1071,6 +1075,97 @@ struct TeamSetupView: View {
         }
         Haptics.score()
         dismiss()
+    }
+}
+
+// MARK: - Music Selection Sheet
+// The full combinable chip cloud, off the main screen. Nothing selected = all music.
+struct MusicSelectionSheet: View {
+    @EnvironmentObject var gameManager: GameManager
+    @Environment(\.dismiss) var dismiss
+
+    let availableGenres = ["Pop", "Rock", "Hip-Hop", "Country", "R&B", "Electronic", "Jazz", "Classical", "Indie", "Alternative"]
+    let availableDecades = ["2020s", "2010s", "2000s", "1990s", "1980s", "1970s", "1960s"]
+
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                VStack(alignment: .leading, spacing: DesignSystem.spacing.lg) {
+                    VStack(alignment: .leading, spacing: DesignSystem.spacing.sm) {
+                        groupLabel("GENRES")
+                        FlowLayout(spacing: DesignSystem.spacing.sm) {
+                            ForEach(availableGenres, id: \.self) { genre in
+                                chip(genre.uppercased(), isOn: gameManager.gameSettings.genres.contains(genre)) {
+                                    if let index = gameManager.gameSettings.genres.firstIndex(of: genre) {
+                                        gameManager.gameSettings.genres.remove(at: index)
+                                    } else {
+                                        gameManager.gameSettings.genres.append(genre)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    VStack(alignment: .leading, spacing: DesignSystem.spacing.sm) {
+                        groupLabel("DECADES")
+                        FlowLayout(spacing: DesignSystem.spacing.sm) {
+                            ForEach(availableDecades, id: \.self) { decade in
+                                chip(decade, isOn: gameManager.gameSettings.decades.contains(decade)) {
+                                    if let index = gameManager.gameSettings.decades.firstIndex(of: decade) {
+                                        gameManager.gameSettings.decades.remove(at: index)
+                                    } else {
+                                        gameManager.gameSettings.decades.append(decade)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                .padding()
+            }
+            .navigationTitle("Music")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Clear") {
+                        Haptics.tap()
+                        withAnimation(DesignSystem.snappy) {
+                            gameManager.gameSettings.genres.removeAll()
+                            gameManager.gameSettings.decades.removeAll()
+                        }
+                    }
+                    .disabled(gameManager.gameSettings.genres.isEmpty && gameManager.gameSettings.decades.isEmpty)
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") { dismiss() }
+                        .font(.body.weight(.semibold))
+                }
+            }
+        }
+        .presentationBackground(Color(red: 0.07, green: 0.07, blue: 0.09))
+        .presentationDetents([.medium, .large])
+    }
+
+    private func groupLabel(_ title: String) -> some View {
+        Text(title)
+            .font(.footnote.weight(.heavy))
+            .tracking(2)
+            .foregroundColor(.secondary)
+    }
+
+    private func chip(_ label: String, isOn: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: {
+            Haptics.tap()
+            withAnimation(DesignSystem.snappy) { action() }
+        }) {
+            Text(label)
+                .font(.subheadline.weight(.heavy))
+                .foregroundColor(isOn ? .black : .white)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(Capsule().fill(isOn ? DesignSystem.colors.primary : Color.white.opacity(0.08)))
+        }
+        .buttonStyle(PressableButtonStyle())
     }
 }
 
