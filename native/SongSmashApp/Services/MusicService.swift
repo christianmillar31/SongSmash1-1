@@ -304,6 +304,17 @@ final class MusicService {
     /// simply leaves the iTunes fallback serving.
     private func ensureMusicKitAuthorization() async {
         guard !musicKitDown, MusicAuthorization.currentStatus == .notDetermined else { return }
+        // Apple's dialog is all-or-nothing ("music and video activity", "media
+        // library") even though we only read the public catalog. Don't show it
+        // unless MusicKit can actually serve: while the MusicKit app service
+        // isn't enabled for this App ID, the developer token fails and every
+        // request would 401 into the iTunes fallback anyway.
+        do {
+            _ = try await DefaultMusicTokenProvider().developerToken(options: [])
+        } catch {
+            demoteMusicKit(error)
+            return
+        }
         let status = await MusicAuthorization.request()
         if status != .authorized {
             print("[MusicService] Apple Music access not granted (\(status)); using iTunes catalog")
