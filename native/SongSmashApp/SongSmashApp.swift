@@ -79,6 +79,12 @@ struct Team: Identifiable {
         }
     }
 
+    // Scoreboard shorthand: one initial per word — "Busy Bella" → "BB",
+    // "Mithil" → "M". Capped at three letters.
+    var initials: String {
+        name.split(separator: " ").prefix(3).compactMap { $0.first }.map(String.init).joined().uppercased()
+    }
+
     init(name: String, colorName: String) {
         self.name = name
         self.colorName = colorName
@@ -1395,15 +1401,18 @@ struct GamePlayView: View {
         .animation(DesignSystem.snappy, value: points)
     }
 
-    // MARK: Scoreboard — a split-color bar anyone can read across the table
+    // MARK: Scoreboard — a split-color bar anyone can read across the table.
+    // Four or more teams: full names can't fit, so segments switch to initials.
     private var scoreBar: some View {
-        HStack(spacing: 2) {
-            ForEach(gameManager.gameSettings.teams) { team in
-                HStack(spacing: 6) {
-                    Text(team.name.uppercased())
+        let teams = gameManager.gameSettings.teams
+        let compact = teams.count >= 4
+        return HStack(spacing: 2) {
+            ForEach(teams) { team in
+                HStack(spacing: compact ? 4 : 6) {
+                    Text(compact ? team.initials : team.name.uppercased())
                         .font(.caption.weight(.heavy))
                         .lineLimit(1)
-                        .minimumScaleFactor(0.4)
+                        .minimumScaleFactor(compact ? 0.8 : 0.4)
                     Text("\(team.score)")
                         .font(.title3.weight(.black))
                         .contentTransition(.numericText())
