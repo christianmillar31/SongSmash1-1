@@ -75,9 +75,15 @@ final class MusicService {
         "Electronic": ["electronic", "dance"],
     ]
 
+    // Order matches GameSetupView's availableDecades (the view references this).
+    static let allDecades = ["2020s", "2010s", "2000s", "1990s", "1980s", "1970s", "1960s"]
+
     private let easyChartCutoff = 40
     private let deepCutSources = 6
     private let deepCutsPerAlbum = 2
+    // Decade searches per genre when the player picked no decades; bounded so
+    // a many-genre selection stays under the iTunes fallback's ~20 req/min.
+    private let allErasSearchBudget = 8
 
     // MARK: - Public API
 
@@ -102,8 +108,14 @@ final class MusicService {
                 pool += filterByDecades(cuts, decades: decades)
             }
 
-            // Charts skew recent, so decades need their own search pass.
-            for decade in decades {
+            // Charts skew recent, so decades need their own search pass. With
+            // no decades picked, sweep them all anyway — otherwise "all music"
+            // is just today's chart, which is almost entirely the last two
+            // years. Sampled per genre to respect the search budget.
+            let searchDecades = decades.isEmpty
+                ? Array(Self.allDecades.shuffled().prefix(max(2, allErasSearchBudget / genreKeys.count)))
+                : decades
+            for decade in searchDecades {
                 let found = await decadeTracks(decade: decade, genre: genre)
                 pool += found.filter { wantedTiers(for: difficulty).contains($0.tier) }
             }
