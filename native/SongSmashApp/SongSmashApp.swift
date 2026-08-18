@@ -1225,6 +1225,14 @@ struct GamePlayView: View {
             .padding(.top, DesignSystem.spacing.sm)
 
             ZStack {
+                // Ghost round number — same watermark language as the year
+                // behind the reveal. The state is in the room, not announced.
+                Text("\(gameManager.currentRoundNumber)")
+                    .font(.system(size: 320, weight: .black, design: .rounded))
+                    .foregroundColor(.white.opacity(0.07))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.4)
+
                 StadiumEqualizer(isPlaying: playerManager.isPlaying)
                     .padding(.horizontal, DesignSystem.spacing.lg)
                     .padding(.top, DesignSystem.spacing.md)
@@ -1235,14 +1243,6 @@ struct GamePlayView: View {
                         .foregroundColor(.white)
                         .contentTransition(.numericText())
                         .padding(.top, DesignSystem.spacing.lg)
-
-                    Text("ROUND \(gameManager.currentRoundNumber), FIRST TO \(gameManager.gameSettings.targetScore)")
-                        .font(.footnote.weight(.heavy))
-                        .tracking(1)
-                        .foregroundColor(.white.opacity(0.85))
-                        .padding(.vertical, 8)
-                        .padding(.horizontal, 14)
-                        .background(Capsule().fill(Color.black.opacity(0.45)))
 
                     Spacer()
                 }
@@ -1384,9 +1384,11 @@ struct GamePlayView: View {
                     .foregroundColor(.black)
                     .contentTransition(.numericText())
 
-                Text(points > 0 ? "+\(points)" : "+1 · +2")
+                // The caption above the grid already explains scoring; the slab
+                // only speaks when it has points ("+1"/"+2"). Space keeps layout.
+                Text(points > 0 ? "+\(points)" : " ")
                     .font(.caption.weight(.heavy))
-                    .foregroundColor(points > 0 ? .white : .black.opacity(0.45))
+                    .foregroundColor(.white)
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, DesignSystem.spacing.md)
