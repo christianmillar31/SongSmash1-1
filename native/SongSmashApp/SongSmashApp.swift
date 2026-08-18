@@ -41,10 +41,12 @@ struct DesignSystem {
     static let animation = Animation.spring(response: 0.4, dampingFraction: 0.8)
     static let snappy = Animation.spring(response: 0.3, dampingFraction: 0.65)
 
+    // v2 "Flame": hot orange accent — see native/DESIGN.md for the design
+    // record and how to restore the green v1.
     static let colors = (
-        primary: Color(red: 0.20, green: 0.84, blue: 0.44),
+        primary: Color(red: 1.0, green: 0.36, blue: 0.0),
         danger: Color(red: 1.0, green: 0.27, blue: 0.23),
-        warning: Color(red: 1.0, green: 0.62, blue: 0.04),
+        warning: Color(red: 1.0, green: 0.84, blue: 0.04),
         background: Color(red: 0.04, green: 0.04, blue: 0.06)
     )
 }
@@ -488,7 +490,7 @@ struct PrimaryButton: View {
             .background(
                 ZStack {
                     RoundedRectangle(cornerRadius: DesignSystem.radius.control, style: .continuous)
-                        .fill(isEnabled ? Color(red: 0.10, green: 0.52, blue: 0.26) : Color.white.opacity(0.04))
+                        .fill(isEnabled ? Color(red: 0.72, green: 0.26, blue: 0.0) : Color.white.opacity(0.04))
                         .offset(y: 5)
                     RoundedRectangle(cornerRadius: DesignSystem.radius.control, style: .continuous)
                         .fill(isEnabled ? DesignSystem.colors.primary : Color.white.opacity(0.08))
@@ -852,9 +854,9 @@ struct GameSetupView: View {
         let items = gameManager.gameSettings.genres.map { $0.uppercased() } + gameManager.gameSettings.decades
         if items.isEmpty { return "ALL MUSIC" }
         if items.count > 4 {
-            return items.prefix(3).joined(separator: " · ") + " +\(items.count - 3)"
+            return items.prefix(3).joined(separator: " × ") + " +\(items.count - 3)"
         }
-        return items.joined(separator: " · ")
+        return items.joined(separator: " × ")
     }
 
     private var difficultySection: some View {
@@ -973,11 +975,12 @@ struct TeamSetupView: View {
         _selectedColorName = State(initialValue: teamToEdit?.colorName ?? "blue")
     }
 
+    // Orange is reserved for the app accent (see DESIGN.md); Team.color still
+    // maps "orange" so previously saved orange teams render fine.
     let colorOptions: [(name: String, color: Color)] = [
         ("red", .red),
         ("blue", .blue),
         ("green", .green),
-        ("orange", .orange),
         ("purple", .purple),
         ("pink", .pink),
         ("yellow", .yellow),
@@ -1233,7 +1236,7 @@ struct GamePlayView: View {
                         .contentTransition(.numericText())
                         .padding(.top, DesignSystem.spacing.lg)
 
-                    Text("ROUND \(gameManager.currentRoundNumber) · FIRST TO \(gameManager.gameSettings.targetScore)")
+                    Text("ROUND \(gameManager.currentRoundNumber), FIRST TO \(gameManager.gameSettings.targetScore)")
                         .font(.footnote.weight(.heavy))
                         .tracking(1)
                         .foregroundColor(.white.opacity(0.85))
@@ -1294,7 +1297,7 @@ struct GamePlayView: View {
 
             Spacer(minLength: 0)
 
-            Text("TAP ONCE +1 · TWICE +2")
+            Text("TAP ONCE +1, TWICE +2")
                 .font(.caption2.weight(.heavy))
                 .tracking(2)
                 .foregroundColor(.secondary)
@@ -1344,7 +1347,7 @@ struct GamePlayView: View {
     private func revealSubtitle(for track: Track) -> String {
         var subtitle = track.artistName.uppercased()
         if let year = track.releaseYear {
-            subtitle += " · \(year)"
+            subtitle += ", \(year)"
         }
         return subtitle
     }
@@ -1578,7 +1581,7 @@ struct GameFinishedView: View {
 
                 VStack(spacing: DesignSystem.spacing.xs) {
                     ForEach(Array(sortedTeams.dropFirst())) { team in
-                        Text("\(team.name.uppercased()) · \(team.score)")
+                        Text("\(team.name.uppercased())  \(team.score)")
                             .font(.subheadline.weight(.heavy))
                             .tracking(1)
                             .foregroundColor(.black.opacity(0.55))
