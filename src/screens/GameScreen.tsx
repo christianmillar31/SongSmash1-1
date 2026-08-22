@@ -1,11 +1,10 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   View,
   StyleSheet,
   ScrollView,
   Alert,
   Image,
-  Text,
   Linking,
 } from 'react-native';
 import {
@@ -14,13 +13,11 @@ import {
   Paragraph,
   Button,
   TextInput,
-  ActivityIndicator,
-  IconButton,
   Chip,
 } from 'react-native-paper';
 import { Audio } from 'expo-av';
 import { useGameStore } from '../store/gameStore';
-import { spotifyService, SpotifyTrack } from '../services/spotifyService';
+import { musicService, Track } from '../services/musicService';
 
 const GameScreen = () => {
   const { teams, filters, currentTrack, setCurrentTrack, addToHistory, setIsPlaying, isPlaying } = useGameStore();
@@ -48,8 +45,10 @@ const GameScreen = () => {
     }
     setLoading(true);
     try {
-      let trackOrResult = await spotifyService.getRandomTrack(filters);
-      if ('noTracks' in (trackOrResult as any)) {
+      const result = await musicService.getRandomTrack(filters);
+      if (!result) {
+        Alert.alert('Error', 'Failed to fetch a track. Please check your connection and try again.');
+      } else if ('noTracks' in result) {
         Alert.alert(
           'No Track Found',
           'No tracks found for your selected filters. Would you like to relax the filters and try again?',
@@ -59,78 +58,74 @@ const GameScreen = () => {
               text: 'Relax Filters',
               onPress: async () => {
                 setLoading(true);
-                const relaxedTrack = await spotifyService.getRandomTrack({ ...filters, relaxFilters: true });
-                setLoading(false);
-                if (relaxedTrack && !('noTracks' in relaxedTrack)) {
-                  await playTrackInApp(relaxedTrack);
-                } else {
-                  Alert.alert('No Track Found', 'No tracks found even after relaxing filters.');
+                try {
+                  const relaxed = await musicService.getRandomTrack({ ...filters, relaxFilters: true });
+                  if (relaxed && !('noTracks' in relaxed)) {
+                    await playTrackInApp(relaxed);
+                  } else {
+                    Alert.alert('No Track Found', 'No tracks found even after relaxing filters.');
+                  }
+                } finally {
+                  setLoading(false);
                 }
               },
             },
           ]
         );
-      } else if (trackOrResult && !('noTracks' in trackOrResult)) {
-        await playTrackInApp(trackOrResult);
       } else {
-        Alert.alert('No Track Found', 'No tracks found with the current filters.');
+        await playTrackInApp(result);
       }
     } catch (error) {
+      console.error('Error fetching track:', error);
       Alert.alert('Error', 'Failed to fetch a random track. Please try again.');
     } finally {
       setLoading(false);
     }
   };
 
-  const playTrackInApp = async (track: SpotifyTrack) => {
+  const playTrackInApp = async (track: Track) => {
     setCurrentTrack(track);
     setShowScores(false);
     setScores({});
-    
+
     try {
-      // Check if track has a preview URL (30 seconds)
-      if (track.preview_url) {
-        console.log('Playing 30-second preview in app');
+      if (track.previewUrl) {
         const { sound: newSound } = await Audio.Sound.createAsync(
-          { uri: track.preview_url },
+          { uri: track.previewUrl },
           { shouldPlay: true, positionMillis: 0 }
         );
         setSound(newSound);
         setIsPlaying(true);
-        
-        // Set up the onPlaybackStatusUpdate to handle when preview ends
+
         newSound.setOnPlaybackStatusUpdate((status) => {
           if (status.isLoaded && status.didJustFinish) {
             setIsPlaying(false);
             setShowScores(true);
           }
         });
+      } else if (track.externalUrl) {
+        // Rare: no preview available — link out to Apple Music instead.
+        Alert.alert(
+          'Play in Apple Music',
+          'No preview is available for this track. Open it in Apple Music, listen, then return here to score!',
+          [
+            { text: 'Cancel', style: 'cancel' },
+            {
+              text: 'Open Apple Music',
+              onPress: () => {
+                Linking.openURL(track.externalUrl!);
+                setIsPlaying(true);
+                setTimeout(() => {
+                  setIsPlaying(false);
+                  setShowScores(true);
+                }, 30000);
+              },
+            },
+          ]
+        );
       } else {
-        // No preview URL - open full track in Spotify from beginning
-        console.log('Opening full track in Spotify from beginning');
-        if (track.external_urls?.spotify) {
-          Alert.alert(
-            'Full Track in Spotify', 
-            'Opening the full track in Spotify from the beginning. Listen to the song, then return here to score!',
-            [
-              { text: 'Cancel', style: 'cancel' },
-              { 
-                text: 'Open Spotify', 
-                onPress: () => {
-                  Linking.openURL(track.external_urls.spotify);
-                  // Allow scoring after a delay
-                  setTimeout(() => {
-                    setIsPlaying(false);
-                    setShowScores(true);
-                  }, 30000); // 30 seconds
-                }
-              }
-            ]
-          );
-        } else {
-          Alert.alert('Track Unavailable', 'This track is not available for playback.');
-          setShowScores(true);
-        }
+        Alert.alert('Track Unavailable', 'This track is not available for playback.');
+        setShowScores(true);
       }
     } catch (error) {
       console.error('Error playing track:', error);
@@ -186,12 +181,7 @@ const GameScreen = () => {
     }
   };
 
-  const getDifficultyFromPopularity = (popularity: number) => {
-    if (popularity >= 75) return 'Easy';
-    if (popularity >= 50) return 'Medium';
-    if (popularity >= 25) return 'Hard';
-    return 'Expert';
-  };
+  const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
   return (
     <View style={styles.container}>
@@ -225,63 +215,57 @@ const GameScreen = () => {
                 <View style={styles.trackHeader}>
                   <View style={styles.trackInfo}>
                     <Title>{currentTrack.name}</Title>
-                    <Paragraph>
-                      {currentTrack.artists.map((artist: { name: string }) => artist.name).join(', ')}
-                    </Paragraph>
-                    <Paragraph>{currentTrack.album.name}</Paragraph>
-                    
-                    {/* Track characteristics like the reference code */}
+                    <Paragraph>{currentTrack.artistName}</Paragraph>
+                    <Paragraph>{currentTrack.albumName}</Paragraph>
+
                     <View style={styles.trackCharacteristics}>
-                      <Chip style={styles.characteristicChip}>
-                        Popularity: {currentTrack.popularity || 0}/100
+                      <Chip
+                        style={[styles.characteristicChip, { backgroundColor: getDifficultyColor(currentTrack.difficulty) }]}
+                        textStyle={{ color: 'white' }}
+                      >
+                        {capitalize(currentTrack.difficulty)}
                       </Chip>
-                      <Chip style={styles.characteristicChip}>
-                        Difficulty: {getDifficultyFromPopularity(currentTrack.popularity || 0)}
-                      </Chip>
-                      {currentTrack.album.release_date && (
+                      {currentTrack.releaseDate && (
                         <Chip style={styles.characteristicChip}>
-                          {currentTrack.album.release_date.slice(0, 4)}
+                          {currentTrack.releaseDate.slice(0, 4)}
                         </Chip>
                       )}
                     </View>
                   </View>
-                  {currentTrack.album.images[0] && (
+                  {currentTrack.artworkUrl && (
                     <Image
-                      source={{ uri: currentTrack.album.images[0].url }}
+                      source={{ uri: currentTrack.artworkUrl }}
                       style={styles.albumArt}
                     />
                   )}
                 </View>
               ) : (
-                // Show minimal info during guessing phase
+                // Show minimal info during guessing phase — no artwork, it can
+                // give the song away.
                 <View style={styles.trackHeader}>
                   <View style={styles.trackInfo}>
                     <Title>🎵 Now Playing</Title>
                     <Paragraph>
-                      {currentTrack.preview_url 
-                        ? 'Listen to the 30-second preview and guess the song!'
-                        : 'Opening full track in Spotify from the beginning. Listen and return here to score!'
+                      {currentTrack.previewUrl
+                        ? 'Listen to the preview and guess the song!'
+                        : 'Listen in Apple Music, then return here to score!'
                       }
                     </Paragraph>
-                    
-                    {/* Only show difficulty and year during guessing */}
+
                     <View style={styles.trackCharacteristics}>
-                      <Chip style={styles.characteristicChip}>
-                        Difficulty: {getDifficultyFromPopularity(currentTrack.popularity || 0)}
+                      <Chip
+                        style={[styles.characteristicChip, { backgroundColor: getDifficultyColor(currentTrack.difficulty) }]}
+                        textStyle={{ color: 'white' }}
+                      >
+                        {capitalize(currentTrack.difficulty)}
                       </Chip>
-                      {currentTrack.album.release_date && (
+                      {currentTrack.releaseDate && (
                         <Chip style={styles.characteristicChip}>
-                          {currentTrack.album.release_date.slice(0, 4)}
+                          {currentTrack.releaseDate.slice(0, 4)}
                         </Chip>
                       )}
                     </View>
                   </View>
-                  {currentTrack.album.images[0] && (
-                    <Image
-                      source={{ uri: currentTrack.album.images[0].url }}
-                      style={styles.albumArt}
-                    />
-                  )}
                 </View>
               )}
 
@@ -311,7 +295,7 @@ const GameScreen = () => {
                 </View>
               )}
 
-              {isPlaying && currentTrack.preview_url && (
+              {isPlaying && currentTrack.previewUrl && (
                 <View style={styles.controls}>
                   <Button
                     mode="outlined"
@@ -323,7 +307,7 @@ const GameScreen = () => {
                 </View>
               )}
 
-              {isPlaying && !currentTrack.preview_url && (
+              {isPlaying && !currentTrack.previewUrl && (
                 <View style={styles.controls}>
                   <Button
                     mode="outlined"
@@ -357,8 +341,8 @@ const GameScreen = () => {
                 </Chip>
               ))}
               {filters.difficulty.map((level) => (
-                <Chip 
-                  key={level} 
+                <Chip
+                  key={level}
                   style={[styles.chip, { backgroundColor: getDifficultyColor(level) }]}
                   textStyle={{ color: 'white' }}
                 >

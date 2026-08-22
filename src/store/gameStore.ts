@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { Track } from '../services/musicService';
 
 export interface Team {
   id: string;
@@ -12,11 +13,18 @@ export interface Filters {
   difficulty: string[];
 }
 
+export interface HistoryEntry {
+  track: Track;
+  scores: Record<string, number>;
+  timestamp: string;
+  teamScores: Array<{ teamId: string; teamName: string; score: number }>;
+}
+
 export interface GameState {
   teams: Team[];
   filters: Filters;
-  currentTrack: any;
-  gameHistory: any[];
+  currentTrack: Track | null;
+  gameHistory: HistoryEntry[];
   isPlaying: boolean;
 }
 
@@ -31,8 +39,8 @@ interface GameStore extends GameState {
   updateFilters: (filters: Partial<Filters>) => void;
   
   // Game actions
-  setCurrentTrack: (track: any) => void;
-  addToHistory: (track: any, scores: Record<string, number>) => void;
+  setCurrentTrack: (track: Track | null) => void;
+  addToHistory: (track: Track, scores: Record<string, number>) => void;
   setIsPlaying: (playing: boolean) => void;
   resetGame: () => void;
 }
@@ -102,13 +110,13 @@ export const useGameStore = create<GameStore>((set, get) => ({
     });
   },
 
-  setCurrentTrack: (track: any) => {
+  setCurrentTrack: (track: Track | null) => {
     set({ currentTrack: track });
   },
 
-  addToHistory: (track: any, scores: Record<string, number>) => {
+  addToHistory: (track: Track, scores: Record<string, number>) => {
     const { gameHistory, teams } = get();
-    const historyEntry = {
+    const historyEntry: HistoryEntry = {
       track,
       scores,
       timestamp: new Date().toISOString(),

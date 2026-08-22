@@ -47,3 +47,7 @@ npm-debug.*
 *.mobileprovision
 *.orig.*
 web-build/
+
+# Local Xcode build output
+ios/build/
+native/build/
