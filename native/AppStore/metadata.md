@@ -1,7 +1,12 @@
 # SongSmash — App Store Connect metadata
 
-Draft for the first submission. Character limits noted per field; everything
-below fits its limit. Replace the placeholder URLs before submitting.
+AS SUBMITTED for v1.0 (2026-08-22, build 4, WAITING_FOR_REVIEW). App Store
+Connect is the source of truth; this file mirrors it. Promotional text ends
+"First team to the target score wins the night." Support URL:
+https://christianmillar31.github.io/SongSmash1-1/ — Privacy policy URL:
+https://christianmillar31.github.io/SongSmash1-1/privacy.html — Copyright:
+2026 Christian Millar. App Privacy published as Data Not Collected; DSA
+declared non-trader; price Free worldwide; iPhone-only.
 
 ## App name (30 chars max)
 
