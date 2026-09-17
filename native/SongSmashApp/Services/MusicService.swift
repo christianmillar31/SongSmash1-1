@@ -13,6 +13,7 @@ struct Track: Codable, Hashable, Identifiable {
     let previewUrl: String?  // ~30s audio preview
     let externalUrl: String? // Apple Music page
     let genreName: String?
+    var isExplicit: Bool = false
     var tier: MusicService.Tier = .medium // fame grade: easy=famous, medium=known, hard=obscure
 
     var releaseYear: Int? {
@@ -53,7 +54,15 @@ final class MusicService {
     }
 
     private let storefront = "us" // iTunes fallback only; MusicKit picks its own
-    private var musicKitDown = false
+
+    // MusicKit health. Failures are counted per queue build, never latched for
+    // the life of the app: one timeout on party wifi used to drop every later
+    // game in the session onto the thinner iTunes catalog.
+    private var musicKitFailures = 0
+    private var musicKitOffForBuild = false
+    /// What the last build actually ran on, for the setup screen's footnote.
+    private(set) var usingFallbackCatalog = false
+    private(set) var catalogNote: String?
 
     private var chartCache: [String: [Track]] = [:]
     private var albumCache: [String: [Track]] = [:]
@@ -61,9 +70,14 @@ final class MusicService {
     private var essentialsCache: [String: [Track]] = [:]
     private var topSongsCache: [String: [String]] = [:] // normalized artist -> ordered songKeys
     private var playedTrackIDs: Set<String> = []
-    // Songs heard in ANY game this session (by title+artist, so remasters and
-    // re-releases count as the same song). Keeps "Play Again" fresh.
-    private var sessionPlayedSongs: Set<String> = []
+    // Songs heard in past games, oldest first, by title+artist so remasters and
+    // re-releases count as the same song. Persisted: a game night that gets
+    // interrupted (phone locked, app swiped away) used to forget everything and
+    // then replay the same songs from the same editorial playlists.
+    private var recentlyPlayed: [String] = []
+    private var recentlyPlayedLoaded = false
+    private static let recentlyPlayedKey = "RecentlyPlayedSongs"
+    private let recentlyPlayedLimit = 600
 
     // Apple genre IDs are shared between the Apple Music API and iTunes.
     // Keys match GameSetupView's availableGenres.
@@ -104,12 +118,19 @@ final class MusicService {
     ]
 
     private let chartFamousCutoff = 25   // current chart rank treated as famous
+    private let genreEssentialsFamousCutoff = 40 // playlist position treated as famous
     private let deepCutSources = 8       // distinct artists mined per hard game
     private let deepCutsPerAlbum = 3
     private let essentialsBudget = 8     // playlist fetches per queue build
     private let deezerLookupBudget = 48  // per build; results cache to disk forever
-    private let maxQueueLength = 150
+    private let maxQueueLength = 300
     private let minEasyPool = 40
+    // One song scores at most 2 points for a team, and rooms routinely draw a
+    // blank, so a game to N can run well past N rounds. Build for the long one.
+    private let roundsPerPoint = 3.0
+    private let minQueueLength = 45
+    private let artistGap = 8            // songs between repeats of one artist
+    private let artistShareDivisor = 25  // queue length per allowed song by one artist
     // Decade searches per genre when the player picked no decades; bounded so
     // a many-genre selection stays under the iTunes fallback's ~20 req/min.
     private let allErasSearchBudget = 8
@@ -118,7 +139,10 @@ final class MusicService {
     private struct GradingContext {
         var chartRank: [String: Int] = [:]      // songKey -> best current chart rank
         var hitsEssentials: Set<String> = []    // songKey in a decade "Hits Essentials"
-        var genreEssentials: Set<String> = []   // songKey in a genre Essentials playlist
+        // songKey -> best position in a genre Essentials playlist. Apple leads
+        // these with the defining hits, so position stands in for fame and
+        // keeps Easy/Medium/Hard distinct within one genre.
+        var genreEssentials: [String: Int] = [:]
         var artistTop: [String: [String]] = [:] // normalized artist -> ordered top-song keys
 
         mutating func recordChartRank(_ rank: Int, for key: String) {
@@ -130,8 +154,24 @@ final class MusicService {
 
     /// Builds a difficulty-stratified game queue for the selected filters.
     /// Only tracks with a playable preview are returned.
-    func loadTracks(genres: [String], decades: [String], difficulty: Difficulty) async throws -> [Track] {
-        playedTrackIDs.removeAll()
+    /// - Parameters:
+    ///   - targetScore: the game's winning score; the queue is sized so a slow
+    ///     game can't run out of songs mid-party.
+    ///   - familyFriendly: drop tracks Apple marks explicit.
+    ///   - continuing: top-up for a game already in progress — keeps what has
+    ///     already been played in this game marked as played.
+    func loadTracks(
+        genres: [String],
+        decades: [String],
+        difficulty: Difficulty,
+        targetScore: Int = 25,
+        familyFriendly: Bool = true,
+        continuing: Bool = false
+    ) async throws -> [Track] {
+        if !continuing { playedTrackIDs.removeAll() }
+        musicKitFailures = 0
+        musicKitOffForBuild = false
+        catalogNote = nil // may be replaced with a specific reason below
         await ensureMusicKitAuthorization()
 
         let genreList = genres.filter { Self.genreIDs[$0] != nil }
@@ -147,6 +187,9 @@ final class MusicService {
                 context.recordChartRank(index + 1, for: songKey(track))
             }
             pool += filterByDecades(chart, decades: decades)
+#if DEBUG
+            dlog("chart \(genre ?? "all"): \(chart.count) → in-decade \(filterByDecades(chart, decades: decades).count)")
+#endif
 
             // Charts skew recent, so decades need their own search pass. With
             // no decades picked, sweep them all anyway — otherwise "all music"
@@ -170,31 +213,152 @@ final class MusicService {
         }
 
         var queue = dedupeSongs(pool).filter { $0.previewUrl != nil }
+        if familyFriendly { queue = queue.filter { !$0.isExplicit } }
         queue = gradeTracks(queue, context: context)
-        queue = await deezerUpgrade(queue, difficulty: difficulty)
+        let needed = min(maxQueueLength, max(minQueueLength, Int(Double(targetScore) * roundsPerPoint)))
+        queue = await deezerUpgrade(queue, difficulty: difficulty, needed: needed)
 
-        // Prefer songs not heard in any game this session; only fall back to
-        // repeats if that would leave too small a queue.
-        let fresh = queue.filter { !sessionPlayedSongs.contains(songKey($0)) }
-        if fresh.count >= 15 {
-            queue = fresh
-        }
+        // Songs the room has heard lately go to the back of the line rather
+        // than being dropped outright: a thin pool should replay the oldest
+        // songs, never repeat the last game wholesale.
+        // Twice the game's length, so tier filtering still has songs to pick from.
+        queue = preferUnheard(queue, needed: needed * 2)
 
-        let assembled = assembleQueue(queue, difficulty: difficulty)
+        let assembled = assembleQueue(queue, difficulty: difficulty, balanceDecades: genreList.isEmpty && decades.isEmpty, limit: needed)
         let famous = queue.filter { $0.tier == .easy }.count
         let known = queue.filter { $0.tier == .medium }.count
-        print("[MusicService] Queue \(assembled.count)/\(queue.count) tracks (fame \(famous)F/\(known)K/\(queue.count - famous - known)O, \(fresh.count) unheard) for genres=\(genreList.isEmpty ? ["All"] : genreList) decades=\(decades) difficulty=\(difficulty.rawValue)")
-#if DEBUG
-        for (index, track) in assembled.prefix(15).enumerated() {
-            print("[MusicService]   \(index + 1). [\(track.tier.rawValue)] \(track.name) — \(track.artistName)")
+        usingFallbackCatalog = !useMusicKit
+        if !usingFallbackCatalog {
+            catalogNote = nil
+        } else if catalogNote == nil {
+            catalogNote = MusicAuthorization.currentStatus == .authorized
+                ? "Apple Music catalog unavailable — using the smaller iTunes catalog."
+                : "Apple Music access is off, so songs come from the smaller iTunes catalog."
         }
+        print("[MusicService] Queue \(assembled.count)/\(queue.count) tracks (fame \(famous)F/\(known)K/\(queue.count - famous - known)O, need \(needed), musicKit=\(useMusicKit)) for genres=\(genreList.isEmpty ? ["All"] : genreList) decades=\(decades) difficulty=\(difficulty.rawValue)")
+#if DEBUG
+        debugReport(assembled, raw: pool.count, deduped: dedupeSongs(pool).count, fresh: queue.count)
 #endif
         return assembled
     }
 
+#if DEBUG
+    private func dlog(_ s: String) { print("[BETA] \(s)") }
+
+    private func debugReport(_ q: [Track], raw: Int, deduped: Int, fresh: Int) {
+        dlog("pool raw=\(raw) deduped=\(deduped) fresh=\(fresh) queue=\(q.count)")
+        func dist(_ tracks: ArraySlice<Track>, _ key: (Track) -> String, top: Int = 12) -> String {
+            var c: [String: Int] = [:]
+            for t in tracks { c[key(t), default: 0] += 1 }
+            return c.sorted { $0.value > $1.value }.prefix(top).map { "\($0.key)=\($0.value)" }.joined(separator: ", ")
+        }
+        let first40 = q.prefix(40)
+        dlog("first40 tiers: \(dist(first40, { $0.tier.rawValue }))")
+        dlog("first40 decades: \(dist(first40, { $0.releaseYear.map { "\($0 / 10 * 10)s" } ?? "?" }))")
+        dlog("first40 genres: \(dist(first40, { $0.genreName ?? "?" }))")
+        dlog("first40 artists: \(dist(first40, { FameDatabase.normalizeArtist($0.artistName) }, top: 8))")
+        dlog("all decades: \(dist(q[...], { $0.releaseYear.map { "\($0 / 10 * 10)s" } ?? "?" }))")
+        dlog("all genres: \(dist(q[...], { $0.genreName ?? "?" }))")
+        dlog("all artists: \(dist(q[...], { FameDatabase.normalizeArtist($0.artistName) }, top: 10))")
+        // Same song under different catalog spellings (songKey misses these).
+        var seen: [String: Track] = [:]
+        for t in q {
+            let k = FameDatabase.normalizeTitle(t.name) + "|" + FameDatabase.normalizeArtist(t.artistName)
+            if let prior = seen[k] {
+                dlog("DUPLICATE: '\(prior.name)' / '\(prior.artistName)' [\(prior.albumName)] vs '\(t.name)' / '\(t.artistName)' [\(t.albumName)]")
+            } else { seen[k] = t }
+        }
+        var titles: [String: Track] = [:]
+        for t in q {
+            let k = FameDatabase.normalizeTitle(t.name)
+            if let prior = titles[k], FameDatabase.normalizeArtist(prior.artistName) != FameDatabase.normalizeArtist(t.artistName) {
+                dlog("SAME TITLE: '\(prior.name)' / '\(prior.artistName)' vs '\(t.name)' / '\(t.artistName)'")
+            }
+            titles[k] = t
+        }
+        for (i, t) in q.prefix(45).enumerated() {
+            dlog("  \(i + 1). [\(t.tier.rawValue)] \(t.releaseYear.map(String.init) ?? "????") \(t.genreName ?? "?") | \(t.name) — \(t.artistName)")
+        }
+    }
+
+    /// Replays the beta-test games from the Sept 2026 feedback, marking the
+    /// first `played` tracks heard like a real game to 20 would.
+    func debugSimulateBeta() async {
+        let mode = UserDefaults.standard.string(forKey: "SimulateBeta") ?? ""
+        var games: [(String, [String], [String], Difficulty, Int, Bool)] = []
+        if mode == "itunes" {
+            debugForceITunes = true
+            games = [
+                ("I4 rock+pop 60-70 easy [iTunes]", ["Rock", "Pop"], ["1960s", "1970s"], .easy, 30, true),
+                ("I5 rock 60-70 medium after I4 [iTunes]", ["Rock"], ["1960s", "1970s"], .medium, 30, false),
+                ("I5b rock 60-70 medium fresh [iTunes]", ["Rock"], ["1960s", "1970s"], .medium, 30, true),
+                ("I2 country 70-90 easy [iTunes]", ["Country"], ["1970s", "1980s", "1990s"], .easy, 30, true),
+                ("I1 all/all easy [iTunes]", [], [], .easy, 30, true),
+            ]
+        } else if mode == "country" {
+            for i in 1...4 { games.append(("C\(i) country 70-90 easy, rematch \(i)", ["Country"], ["1970s", "1980s", "1990s"], .easy, 30, i == 1)) }
+        } else if mode == "hard" {
+            games = [
+                ("H1 rock 60-70 hard", ["Rock"], ["1960s", "1970s"], .hard, 30, true),
+                ("H2 all/all hard", [], [], .hard, 30, true),
+                ("H3 country 70-90 hard", ["Country"], ["1970s", "1980s", "1990s"], .hard, 30, true),
+            ]
+        } else {
+            games = [
+                ("G1 all/all easy", [], [], .easy, 30, true),
+                ("G2 country 70-90 easy", ["Country"], ["1970s", "1980s", "1990s"], .easy, 30, true),
+                ("G4 rock+pop 60-70 easy", ["Rock", "Pop"], ["1960s", "1970s"], .easy, 30, true),
+                ("G5 rock 60-70 medium (after G4)", ["Rock"], ["1960s", "1970s"], .medium, 30, false),
+                ("G5b rock 60-70 medium (fresh session)", ["Rock"], ["1960s", "1970s"], .medium, 30, true),
+            ]
+        }
+        for (name, genres, decades, difficulty, played, reset) in games {
+            if reset {
+                recentlyPlayed.removeAll()
+                recentlyPlayedLoaded = true
+                UserDefaults.standard.removeObject(forKey: Self.recentlyPlayedKey)
+            }
+            dlog("==================== \(name) ====================")
+            let q = (try? await loadTracks(genres: genres, decades: decades, difficulty: difficulty, targetScore: 20)) ?? []
+            for t in q.prefix(played) { markTrackAsPlayed(t) }
+        }
+        dlog("SIMULATION DONE")
+    }
+#endif
+
     func markTrackAsPlayed(_ track: Track) {
         playedTrackIDs.insert(track.id)
-        sessionPlayedSongs.insert(songKey(track))
+        loadRecentlyPlayedIfNeeded()
+        let key = songKey(track)
+        recentlyPlayed.removeAll { $0 == key }
+        recentlyPlayed.append(key)
+        if recentlyPlayed.count > recentlyPlayedLimit {
+            recentlyPlayed.removeFirst(recentlyPlayed.count - recentlyPlayedLimit)
+        }
+        UserDefaults.standard.set(recentlyPlayed, forKey: Self.recentlyPlayedKey)
+    }
+
+    private func loadRecentlyPlayedIfNeeded() {
+        guard !recentlyPlayedLoaded else { return }
+        recentlyPlayedLoaded = true
+        recentlyPlayed = UserDefaults.standard.stringArray(forKey: Self.recentlyPlayedKey) ?? []
+    }
+
+    /// Unheard songs first; if there still aren't enough for the game, top up
+    /// with the ones heard longest ago.
+    private func preferUnheard(_ tracks: [Track], needed: Int) -> [Track] {
+        loadRecentlyPlayedIfNeeded()
+        var heardAt: [String: Int] = [:]
+        for (index, key) in recentlyPlayed.enumerated() { heardAt[key] = index }
+
+        var unheard: [Track] = []
+        var heard: [Track] = []
+        for track in tracks {
+            if heardAt[songKey(track)] == nil { unheard.append(track) } else { heard.append(track) }
+        }
+        guard unheard.count < needed else { return unheard }
+        heard.sort { (heardAt[songKey($0)] ?? 0) < (heardAt[songKey($1)] ?? 0) }
+        return unheard + heard.prefix(needed - unheard.count)
     }
 
     func shouldSkipTrack(_ track: Track) -> Bool {
@@ -221,7 +385,13 @@ final class MusicService {
             grade = max(grade, rank <= chartFamousCutoff ? .famous : .known)
         }
         if context.hitsEssentials.contains(key) { grade = max(grade, .famous) }
-        if context.genreEssentials.contains(key) { grade = max(grade, .known) }
+        // Apple's genre Essentials are only fetched for genres the player chose,
+        // and to a room that picked Country, the front of "'70s Country
+        // Essentials" IS the easy round. Grading all of it merely "known" left
+        // Easy country with a handful of pop-crossover hits by the same artists.
+        if let rank = context.genreEssentials[key] {
+            grade = max(grade, rank < genreEssentialsFamousCutoff ? .famous : .known)
+        }
         if let top = context.artistTop[FameDatabase.normalizeArtist(track.artistName)],
            let index = top.firstIndex(of: key) {
             grade = max(grade, index < 5 ? .famous : .known)
@@ -241,10 +411,15 @@ final class MusicService {
     /// cuts and non-US hits never charted here. Hard games vet every would-be
     /// challenger (budget permitting); easy/medium only when the recognizable
     /// pool is thin. Lookups cache to disk, so repeat games cost nothing.
-    private func deezerUpgrade(_ tracks: [Track], difficulty: Difficulty) async -> [Track] {
+    private func deezerUpgrade(_ tracks: [Track], difficulty: Difficulty, needed: Int) async -> [Track] {
         var tracks = tracks
-        let recognizable = tracks.filter { $0.tier != .hard }.count
-        if difficulty != .hard && recognizable >= minEasyPool { return tracks }
+        // Easy needs enough *famous* songs, not merely recognizable ones. On the
+        // iTunes fallback — no editorial playlists — a genre like Country only
+        // musters a couple dozen, which is how one artist ended up owning a game.
+        let recognizable = difficulty == .easy
+            ? tracks.filter { $0.tier == .easy }.count
+            : tracks.filter { $0.tier != .hard }.count
+        if difficulty != .hard && recognizable >= needed { return tracks }
 
         let candidates = tracks.indices.filter { tracks[$0].tier == .hard }.shuffled()
         let chosen = Array(candidates.prefix(deezerLookupBudget))
@@ -274,7 +449,7 @@ final class MusicService {
                 }
             }
         }
-        DeezerRankService.shared.persistCache()
+        await DeezerRankService.shared.persistCache()
         if upgraded > 0 { print("[MusicService] Deezer upgraded \(upgraded)/\(chosen.count) obscure tracks") }
         return tracks
     }
@@ -284,34 +459,85 @@ final class MusicService {
     /// Orders the graded pool for the chosen difficulty. Harder queues carry
     /// challengers, but anchors are woven in so no window of three songs is
     /// ever all-unrecognizable — the thing that kills a party.
-    private func assembleQueue(_ tracks: [Track], difficulty: Difficulty) -> [Track] {
+    private func assembleQueue(_ tracks: [Track], difficulty: Difficulty, balanceDecades: Bool, limit: Int) -> [Track] {
         let famous = tracks.filter { $0.tier == .easy }.shuffled()
         let known = tracks.filter { $0.tier == .medium }.shuffled()
         let obscure = tracks.filter { $0.tier == .hard }.shuffled()
 
+        var ordered: [Track]
         switch difficulty {
         case .easy:
-            var queue = famous
-            if queue.count < minEasyPool {
+            ordered = famous
+            if ordered.count < max(minEasyPool, limit) {
                 // Thin era/genre combo: pad with the most defensible knowns.
-                queue = (queue + known.prefix(minEasyPool - queue.count)).shuffled()
-                print("[MusicService] Easy pool thin (\(famous.count) famous); padded with \(queue.count - famous.count) known")
+                let padding = known.prefix(max(minEasyPool, limit) - ordered.count)
+                ordered = (ordered + padding).shuffled()
+                if !padding.isEmpty {
+                    print("[MusicService] Easy pool thin (\(famous.count) famous); padded with \(padding.count) known")
+                }
             }
-            return Array(queue.prefix(maxQueueLength))
         case .medium:
-            var queue = interleave(anchors: famous, others: known, maxOthersRun: 2)
-            if queue.count < minEasyPool {
-                queue += obscure.prefix(minEasyPool - queue.count)
+            ordered = interleave(anchors: famous, others: known, maxOthersRun: 2)
+            if ordered.count < limit {
+                ordered += obscure.prefix(limit - ordered.count)
             }
-            return Array(queue.prefix(maxQueueLength))
         case .hard:
             var anchors = known
             if anchors.count * 2 < obscure.count {
                 // Not enough knowns to anchor every third slot; promote hits.
                 anchors = (anchors + famous).shuffled()
             }
-            return Array(interleave(anchors: anchors, others: obscure, maxOthersRun: 2).prefix(maxQueueLength))
+            ordered = interleave(anchors: anchors, others: obscure, maxOthersRun: 2)
         }
+
+        if balanceDecades { ordered = roundRobinByDecade(ordered) }
+        return spreadArtists(ordered, limit: min(limit, maxQueueLength))
+    }
+
+    /// Deals the queue out decade by decade so "all music" isn't 40% of
+    /// whatever is charting now — every era a player might know gets an equal
+    /// share of the front of the queue, which is all a game actually reaches.
+    private func roundRobinByDecade(_ tracks: [Track]) -> [Track] {
+        var buckets: [Int: [Track]] = [:]
+        for track in tracks {
+            buckets[(track.releaseYear ?? 0) / 10 * 10, default: []].append(track)
+        }
+        var out: [Track] = []
+        out.reserveCapacity(tracks.count)
+        while !buckets.isEmpty {
+            for decade in buckets.keys.shuffled() {
+                guard var bucket = buckets[decade], !bucket.isEmpty else { continue }
+                out.append(bucket.removeFirst())
+                buckets[decade] = bucket.isEmpty ? nil : bucket
+            }
+        }
+        return out
+    }
+
+    /// Keeps one artist from taking over a game: no repeat within `artistGap`
+    /// songs and a per-game cap, both enforced by pushing that artist's other
+    /// songs later rather than dropping them, so the queue never gets shorter.
+    private func spreadArtists(_ tracks: [Track], limit: Int) -> [Track] {
+        let cap = max(2, limit / artistShareDivisor)
+        var remaining = tracks
+        var out: [Track] = []
+        var playedAt: [String: Int] = [:]
+        var count: [String: Int] = [:]
+
+        while out.count < limit, !remaining.isEmpty {
+            let pick = remaining.firstIndex { track in
+                let artist = FameDatabase.normalizeArtist(track.artistName)
+                if count[artist, default: 0] >= cap { return false }
+                if let last = playedAt[artist], out.count - last < artistGap { return false }
+                return true
+            } ?? 0 // every candidate is capped: take the best one left anyway
+            let track = remaining.remove(at: pick)
+            let artist = FameDatabase.normalizeArtist(track.artistName)
+            playedAt[artist] = out.count
+            count[artist, default: 0] += 1
+            out.append(track)
+        }
+        return out
     }
 
     /// Random weave of two pools, never allowing more than maxOthersRun
@@ -365,21 +591,31 @@ final class MusicService {
     }
 
     // "Billie Jean", "Billie Jean (Remastered)" and "Billie Jean - Single" are
-    // the same song; key on cleaned title + artist, not track ID.
+    // the same song; key on cleaned title + artist, not track ID. Uses the fame
+    // database's normalization, which also folds punctuation and curly quotes —
+    // "Sugar, Sugar" and "Sugar Sugar" are one song, and used to be two.
     private func songKey(_ track: Track) -> String {
-        var title = track.name.lowercased()
-        for separator in [" (", " [", " - "] {
-            if let range = title.range(of: separator) {
-                title = String(title[..<range.lowerBound])
-            }
-        }
-        return title.trimmingCharacters(in: .whitespaces) + "|" + track.artistName.lowercased()
+        FameDatabase.normalizeTitle(track.name) + "|" + FameDatabase.normalizeArtist(track.artistName)
     }
 
     private func dedupeSongs(_ tracks: [Track]) -> [Track] {
         var ids = Set<String>()
-        var keys = Set<String>()
-        return tracks.filter { ids.insert($0.id).inserted && keys.insert(songKey($0)).inserted }
+        var artistsByTitle: [String: [String]] = [:]
+        var out: [Track] = []
+        for track in tracks {
+            guard ids.insert(track.id).inserted else { continue }
+            let title = FameDatabase.normalizeTitle(track.name)
+            let artist = FameDatabase.normalizeArtist(track.artistName)
+            guard !title.isEmpty, !artist.isEmpty else { continue }
+            // The catalog credits one recording several ways — "Charlie Daniels"
+            // and "The Charlie Daniels Band" both carry Devil Went Down to
+            // Georgia. Same title and one credit inside the other = same song.
+            let seen = artistsByTitle[title] ?? []
+            if seen.contains(where: { $0 == artist || $0.contains(artist) || artist.contains($0) }) { continue }
+            artistsByTitle[title, default: []].append(artist)
+            out.append(track)
+        }
+        return out
     }
 
     // MARK: - Pool builders
@@ -391,15 +627,19 @@ final class MusicService {
         if let cached = chartCache[cacheKey] { return cached }
 
         var tracks: [Track] = []
+        var fetched = false
         if useMusicKit {
-            do { tracks = try await musicKitChartTracks(genre: genre) }
+            do { tracks = try await musicKitChartTracks(genre: genre); fetched = true }
             catch { demoteMusicKit(error) }
         }
         if tracks.isEmpty {
-            do { tracks = try await itunesChartTracks(genre: genre) }
+            do { tracks = try await itunesChartTracks(genre: genre); fetched = true }
             catch { print("[MusicService] chart fetch failed for \(genre ?? "all"): \(error)") }
         }
-        chartCache[cacheKey] = tracks
+        // Never cache a failure. A rate-limited or dropped request used to be
+        // remembered as "this genre has no songs" for the rest of the session,
+        // so every later game in the night was built from a smaller pool.
+        if fetched { chartCache[cacheKey] = tracks }
         return tracks
     }
 
@@ -413,12 +653,13 @@ final class MusicService {
         let term = "\(shorthand) \(genre ?? "hits")"
 
         var results: [Track] = []
+        var fetched = false
         if useMusicKit {
-            do { results = try await musicKitSearchTracks(term: term) }
+            do { results = try await musicKitSearchTracks(term: term); fetched = true }
             catch { demoteMusicKit(error) }
         }
         if results.isEmpty {
-            do { results = try await itunesSearchTracks(term: term) }
+            do { results = try await itunesSearchTracks(term: term); fetched = true }
             catch { print("[MusicService] decade search failed for \(term): \(error)") }
         }
 
@@ -427,7 +668,11 @@ final class MusicService {
             guard let year = track.releaseYear, year >= range.0, year <= range.1 else { return false }
             return matchesGenre(label: track.genreName, genre: genre)
         }
-        searchCache[cacheKey] = filtered
+#if DEBUG
+        let inYears = results.filter { ($0.releaseYear ?? 0) >= range.0 && ($0.releaseYear ?? 0) <= range.1 }.count
+        dlog("search '\(term)': raw \(results.count) → in-decade \(inYears) → genre-match \(filtered.count)")
+#endif
+        if fetched { searchCache[cacheKey] = filtered }
         return filtered
     }
 
@@ -444,8 +689,12 @@ final class MusicService {
         guard useMusicKit else { return [] }
 
         var hitsSpecs: [EssentialsSpec] = decades.map { EssentialsSpec(genre: nil, decade: $0) }
-        if decades.isEmpty && !genres.isEmpty {
-            hitsSpecs = [] // genre-only games get genre Essentials below
+        if decades.isEmpty {
+            // "All music" used to fetch no editorial playlists at all, leaving
+            // the queue to today's chart plus whatever search turned up — which
+            // is why a room with parents in it heard mostly the last few years.
+            // Sweep every decade so each era has a bench of real hits.
+            hitsSpecs = genres.isEmpty ? Self.allDecades.map { EssentialsSpec(genre: nil, decade: $0) } : []
         }
         var genreSpecs: [EssentialsSpec] = []
         for genre in genres {
@@ -456,24 +705,36 @@ final class MusicService {
             }
         }
 
-        let specs = (hitsSpecs + genreSpecs.shuffled()).prefix(essentialsBudget)
+        let specs = (hitsSpecs + genreSpecs.shuffled()).prefix(max(essentialsBudget, hitsSpecs.count))
         var collected: [Track] = []
+#if DEBUG
+        dlog("essentials specs: \(specs.map { "\($0.genre ?? "Hits")/\($0.decade ?? "all")" }) (of \(hitsSpecs.count + genreSpecs.count))")
+#endif
         for spec in specs {
             var tracks = await essentialsPlaylistTracks(spec)
+#if DEBUG
+            let rawCount = tracks.count
+#endif
             if let decade = spec.decade {
                 tracks = filterByDecades(tracks, decades: [decade])
             }
+#if DEBUG
+            let decadeCount = tracks.count
+#endif
             if spec.genre == nil && !genres.isEmpty {
                 // Cross-genre hits playlist inside a genre-filtered game: keep
                 // only tracks whose label matches some selected genre.
                 tracks = tracks.filter { track in genres.contains { matchesGenre(label: track.genreName, genre: $0) } }
             }
-            for track in tracks {
+#if DEBUG
+            dlog("essentials \(spec.genre ?? "Hits")/\(spec.decade ?? "all"): raw \(rawCount) → in-decade \(decadeCount) → genre-match \(tracks.count)")
+#endif
+            for (index, track) in tracks.enumerated() {
                 let key = songKey(track)
                 if spec.genre == nil {
                     context.hitsEssentials.insert(key)
                 } else {
-                    context.genreEssentials.insert(key)
+                    context.genreEssentials[key] = min(index, context.genreEssentials[key] ?? Int.max)
                 }
             }
             collected += tracks
@@ -493,7 +754,7 @@ final class MusicService {
         if tracks.isEmpty {
             tracks = await searchEssentialsPlaylist(spec)
         }
-        essentialsCache[cacheKey] = tracks
+        if !tracks.isEmpty { essentialsCache[cacheKey] = tracks }
         if !tracks.isEmpty {
             print("[MusicService] Essentials \(cacheKey): \(tracks.count) tracks")
         }
@@ -526,13 +787,13 @@ final class MusicService {
             var request = MusicCatalogSearchRequest(term: term, types: [Playlist.self])
             request.limit = 25
             let response = try await request.response()
-            let wanted = compact(subject)
+            // Exact name match only. "contains" also accepted "'60s Italian Pop
+            // Essentials" and "K-Pop Essentials", which is how Italian pop
+            // turned up in a US 60s/70s rock game.
+            let wanted = compact((decadeToken ?? "") + subject + "Essentials")
             let playlist = response.playlists.first { playlist in
                 guard (playlist.curatorName ?? "").lowercased().hasPrefix("apple music") else { return false }
-                let name = compact(playlist.name)
-                guard name.contains("essentials"), name.contains(wanted) else { return false }
-                if let decadeToken { return name.contains(compact(decadeToken)) }
-                return true
+                return compact(playlist.name) == wanted
             }
             guard let playlist else { return [] }
             let detailed = try await playlist.with(.tracks)
@@ -564,7 +825,7 @@ final class MusicService {
             let key = songKey(track)
             let recognizable = context.chartRank[key] != nil
                 || context.hitsEssentials.contains(key)
-                || context.genreEssentials.contains(key)
+                || context.genreEssentials[key] != nil
                 || FameDatabase.shared.lookup(title: track.name, artist: track.artistName)?.grade == .famous
             guard recognizable else { continue }
             if seenArtists.insert(FameDatabase.normalizeArtist(track.artistName)).inserted {
@@ -629,7 +890,7 @@ final class MusicService {
             do { tracks = try await itunesAlbumTracks(albumId: albumId) }
             catch { print("[MusicService] album lookup failed for \(albumId): \(error)") }
         }
-        albumCache[albumId] = tracks
+        if !tracks.isEmpty { albumCache[albumId] = tracks }
         return tracks
     }
 
@@ -647,13 +908,21 @@ final class MusicService {
     // Authorization is re-checked per queue build (not latched), so granting
     // access later in Settings upgrades the next game without a relaunch.
     private var useMusicKit: Bool {
-        !musicKitDown && MusicAuthorization.currentStatus == .authorized
+#if DEBUG
+        if debugForceITunes { return false }
+#endif
+        return !musicKitOffForBuild && MusicAuthorization.currentStatus == .authorized
     }
+#if DEBUG
+    private var debugForceITunes = false
+#endif
 
     /// Triggers the one-time system prompt. Any outcome other than .authorized
-    /// simply leaves the iTunes fallback serving.
+    /// simply leaves the iTunes fallback serving. Retried on every queue build:
+    /// a developer token that fails once (no network at launch) must not cost
+    /// the player the full catalog for the rest of the night.
     private func ensureMusicKitAuthorization() async {
-        guard !musicKitDown, MusicAuthorization.currentStatus == .notDetermined else { return }
+        guard MusicAuthorization.currentStatus == .notDetermined else { return }
         // Apple's dialog is all-or-nothing ("music and video activity", "media
         // library") even though we only read the public catalog. Don't show it
         // unless MusicKit can actually serve: while the MusicKit app service
@@ -662,6 +931,16 @@ final class MusicService {
         do {
             _ = try await DefaultMusicTokenProvider().developerToken(options: [])
         } catch {
+            // A failed token can stick in the cache; force one fresh attempt
+            // before writing the catalog off for this build.
+            if (try? await DefaultMusicTokenProvider().developerToken(options: .ignoreCache)) != nil {
+                _ = await MusicAuthorization.request()
+                return
+            }
+            // Surfaced in the setup screen so a tester can report the real
+            // reason instead of just seeing a thin, odd-looking setlist.
+            catalogNote = "Apple Music catalog unavailable on this device (\(error.localizedDescription))."
+            print("[MusicService] developer token failed: \(error)")
             demoteMusicKit(error)
             return
         }
@@ -673,10 +952,16 @@ final class MusicService {
 
     private var genreCache: [Int: Genre] = [:]
 
+    /// Counts MusicKit failures within one queue build. A couple of dropped
+    /// requests are normal on party wifi and are simply retried next build;
+    /// only a build that keeps failing switches to iTunes, and only for itself.
     private func demoteMusicKit(_ error: Error) {
-        if !musicKitDown {
-            print("[MusicService] MusicKit unavailable (is the MusicKit app service enabled for this App ID?), falling back to iTunes: \(error)")
-            musicKitDown = true
+        musicKitFailures += 1
+        guard !musicKitOffForBuild else { return }
+        print("[MusicService] MusicKit request failed (\(musicKitFailures)): \(error)")
+        if musicKitFailures >= 3 {
+            musicKitOffForBuild = true
+            print("[MusicService] MusicKit failing repeatedly; using iTunes for this queue only")
         }
     }
 
@@ -699,7 +984,8 @@ final class MusicService {
             releaseDate: song.releaseDate.map { Self.releaseDateFormatter.string(from: $0) },
             previewUrl: song.previewAssets?.first?.url?.absoluteString,
             externalUrl: song.url?.absoluteString,
-            genreName: song.genreNames.first
+            genreName: song.genreNames.first,
+            isExplicit: song.contentRating == .explicit
         )
     }
 
@@ -784,7 +1070,8 @@ final class MusicService {
             releaseDate: r["releaseDate"] as? String,
             previewUrl: r["previewUrl"] as? String,
             externalUrl: r["trackViewUrl"] as? String,
-            genreName: r["primaryGenreName"] as? String
+            genreName: r["primaryGenreName"] as? String,
+            isExplicit: (r["trackExplicitness"] as? String) == "explicit"
         )
     }
 
