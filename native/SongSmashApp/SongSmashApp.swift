@@ -638,6 +638,10 @@ struct ContentView: View {
                     gameManager.gameSettings.genres = []
                     gameManager.gameSettings.decades = []
                 }
+                if let demoDifficulty = UserDefaults.standard.string(forKey: "DemoDifficulty"),
+                   let difficulty = Difficulty(rawValue: demoDifficulty) {
+                    gameManager.gameSettings.difficulty = difficulty
+                }
                 switch UserDefaults.standard.string(forKey: "AutoDemoState") {
                 case "setup":
                     break // seeded settings only; stay on the setup screen

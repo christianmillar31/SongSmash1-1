@@ -13,7 +13,7 @@ struct Track: Codable, Hashable, Identifiable {
     let previewUrl: String?  // ~30s audio preview
     let externalUrl: String? // Apple Music page
     let genreName: String?
-    var tier: MusicService.Tier = .medium
+    var tier: MusicService.Tier = .medium // fame grade: easy=famous, medium=known, hard=obscure
 
     var releaseYear: Int? {
         guard let releaseDate, releaseDate.count >= 4 else { return nil }
@@ -33,6 +33,18 @@ struct Track: Codable, Hashable, Identifiable {
 // Catalog-only: no Apple Music subscription needed, but MusicKit requires the
 // one-time MusicAuthorization prompt (it refuses even catalog requests while
 // status is .notDetermined). Declining just means the iTunes fallback serves.
+//
+// Difficulty pipeline (no API exposes a song popularity number, so fame is
+// assembled from layered signals):
+//  1. Collect candidates: genre charts, decade searches, Apple editorial
+//     "Essentials" playlists, and (hard games) album deep cuts mined from
+//     famous artists.
+//  2. Grade each song famous/known/obscure using the bundled chart-history
+//     database (FameDatabase), current chart rank, Essentials membership,
+//     and the artist's top-songs list; Deezer's rank upgrades stragglers the
+//     local signals missed (famous album cuts, non-US hits).
+//  3. Assemble the queue for the chosen difficulty with anchors interleaved
+//     so players never hear three unrecognizable songs in a row.
 final class MusicService {
     static let shared = MusicService()
 
@@ -46,6 +58,8 @@ final class MusicService {
     private var chartCache: [String: [Track]] = [:]
     private var albumCache: [String: [Track]] = [:]
     private var searchCache: [String: [Track]] = [:]
+    private var essentialsCache: [String: [Track]] = [:]
+    private var topSongsCache: [String: [String]] = [:] // normalized artist -> ordered songKeys
     private var playedTrackIDs: Set<String> = []
     // Songs heard in ANY game this session (by title+artist, so remasters and
     // re-releases count as the same song). Keeps "Play Again" fresh.
@@ -78,17 +92,44 @@ final class MusicService {
     // Order matches GameSetupView's availableDecades (the view references this).
     static let allDecades = ["2020s", "2010s", "2000s", "1990s", "1980s", "1970s", "1960s"]
 
-    private let easyChartCutoff = 40
-    private let deepCutSources = 6
-    private let deepCutsPerAlbum = 2
+    // Apple's decade "Hits Essentials" playlists (verified 2026-08; IDs are
+    // storefront-agnostic). Seeds only — a search fallback re-resolves when a
+    // seed stops loading, so rotation by Apple is survivable.
+    private static let decadeHitsPlaylistIDs: [String: String] = [
+        "1970s": "pl.1745c21b5f084936ad637b4cd5cbd99a",
+        "1980s": "pl.af4d982795c6472ea48579eb147cd726",
+        "1990s": "pl.0d70b7c9be8e4e0b95ebbf5578aaf7a2",
+        "2000s": "pl.e50ccee7318043eaaf8e8e28a2a55114",
+        "2010s": "pl.6b1b5dfda067443481265436811002f1",
+    ]
+
+    private let chartFamousCutoff = 25   // current chart rank treated as famous
+    private let deepCutSources = 8       // distinct artists mined per hard game
+    private let deepCutsPerAlbum = 3
+    private let essentialsBudget = 8     // playlist fetches per queue build
+    private let deezerLookupBudget = 48  // per build; results cache to disk forever
+    private let maxQueueLength = 150
+    private let minEasyPool = 40
     // Decade searches per genre when the player picked no decades; bounded so
     // a many-genre selection stays under the iTunes fallback's ~20 req/min.
     private let allErasSearchBudget = 8
 
+    // Signals gathered while collecting candidates, consumed by grading.
+    private struct GradingContext {
+        var chartRank: [String: Int] = [:]      // songKey -> best current chart rank
+        var hitsEssentials: Set<String> = []    // songKey in a decade "Hits Essentials"
+        var genreEssentials: Set<String> = []   // songKey in a genre Essentials playlist
+        var artistTop: [String: [String]] = [:] // normalized artist -> ordered top-song keys
+
+        mutating func recordChartRank(_ rank: Int, for key: String) {
+            chartRank[key] = min(rank, chartRank[key] ?? Int.max)
+        }
+    }
+
     // MARK: - Public API
 
-    /// Builds a shuffled game queue for the selected filters. Only tracks with
-    /// a playable preview are returned.
+    /// Builds a difficulty-stratified game queue for the selected filters.
+    /// Only tracks with a playable preview are returned.
     func loadTracks(genres: [String], decades: [String], difficulty: Difficulty) async throws -> [Track] {
         playedTrackIDs.removeAll()
         await ensureMusicKitAuthorization()
@@ -98,15 +139,14 @@ final class MusicService {
         let genreKeys: [String?] = genreList.isEmpty ? [nil] : genreList
 
         var pool: [Track] = []
+        var context = GradingContext()
+
         for genre in genreKeys {
             let chart = await chartTracks(genre: genre)
-            let chartInDecades = filterByDecades(chart, decades: decades)
-            pool += chartInDecades.filter { wantedTiers(for: difficulty).contains($0.tier) }
-
-            if difficulty == .hard {
-                let cuts = await deepCuts(from: chart)
-                pool += filterByDecades(cuts, decades: decades)
+            for (index, track) in chart.enumerated() {
+                context.recordChartRank(index + 1, for: songKey(track))
             }
+            pool += filterByDecades(chart, decades: decades)
 
             // Charts skew recent, so decades need their own search pass. With
             // no decades picked, sweep them all anyway — otherwise "all music"
@@ -116,12 +156,22 @@ final class MusicService {
                 ? Array(Self.allDecades.shuffled().prefix(max(2, allErasSearchBudget / genreKeys.count)))
                 : decades
             for decade in searchDecades {
-                let found = await decadeTracks(decade: decade, genre: genre)
-                pool += found.filter { wantedTiers(for: difficulty).contains($0.tier) }
+                pool += await decadeTracks(decade: decade, genre: genre)
             }
         }
 
+        // Apple editorial Essentials playlists: human-curated "everyone knows
+        // these" pools per decade and genre — the backbone of easy queues for
+        // eras the current charts can't reach.
+        pool += await essentialsTracks(genres: genreList, decades: decades, context: &context)
+
+        if difficulty == .hard {
+            pool += await deepCuts(pool: pool, context: &context)
+        }
+
         var queue = dedupeSongs(pool).filter { $0.previewUrl != nil }
+        queue = gradeTracks(queue, context: context)
+        queue = await deezerUpgrade(queue, difficulty: difficulty)
 
         // Prefer songs not heard in any game this session; only fall back to
         // repeats if that would leave too small a queue.
@@ -130,9 +180,16 @@ final class MusicService {
             queue = fresh
         }
 
-        queue.shuffle()
-        print("[MusicService] Built queue of \(queue.count) tracks (\(fresh.count) unheard) for genres=\(genreList.isEmpty ? ["All"] : genreList) decades=\(decades) difficulty=\(difficulty.rawValue)")
-        return Array(queue.prefix(150))
+        let assembled = assembleQueue(queue, difficulty: difficulty)
+        let famous = queue.filter { $0.tier == .easy }.count
+        let known = queue.filter { $0.tier == .medium }.count
+        print("[MusicService] Queue \(assembled.count)/\(queue.count) tracks (fame \(famous)F/\(known)K/\(queue.count - famous - known)O, \(fresh.count) unheard) for genres=\(genreList.isEmpty ? ["All"] : genreList) decades=\(decades) difficulty=\(difficulty.rawValue)")
+#if DEBUG
+        for (index, track) in assembled.prefix(15).enumerated() {
+            print("[MusicService]   \(index + 1). [\(track.tier.rawValue)] \(track.name) — \(track.artistName)")
+        }
+#endif
+        return assembled
     }
 
     func markTrackAsPlayed(_ track: Track) {
@@ -144,14 +201,146 @@ final class MusicService {
         playedTrackIDs.contains(track.id)
     }
 
-    // MARK: - Tiering
+    // MARK: - Grading
 
-    private func wantedTiers(for difficulty: Difficulty) -> Set<Tier> {
-        switch difficulty {
-        case .easy: return [.easy]
-        case .medium: return [.easy, .medium]
-        case .hard: return [.medium, .hard]
+    private func gradeTracks(_ tracks: [Track], context: GradingContext) -> [Track] {
+        tracks.map { track in
+            var t = track
+            t.tier = tier(for: localGrade(track, context: context))
+            return t
         }
+    }
+
+    private func localGrade(_ track: Track, context: GradingContext) -> FameGrade {
+        var grade = FameGrade.obscure
+        if let record = FameDatabase.shared.lookup(title: track.name, artist: track.artistName) {
+            grade = max(grade, record.grade)
+        }
+        let key = songKey(track)
+        if let rank = context.chartRank[key] {
+            grade = max(grade, rank <= chartFamousCutoff ? .famous : .known)
+        }
+        if context.hitsEssentials.contains(key) { grade = max(grade, .famous) }
+        if context.genreEssentials.contains(key) { grade = max(grade, .known) }
+        if let top = context.artistTop[FameDatabase.normalizeArtist(track.artistName)],
+           let index = top.firstIndex(of: key) {
+            grade = max(grade, index < 5 ? .famous : .known)
+        }
+        return grade
+    }
+
+    private func tier(for grade: FameGrade) -> Tier {
+        switch grade {
+        case .famous: return .easy
+        case .known: return .medium
+        case .obscure: return .hard
+        }
+    }
+
+    /// Ask Deezer to grade songs the local signals left obscure: famous album
+    /// cuts and non-US hits never charted here. Hard games vet every would-be
+    /// challenger (budget permitting); easy/medium only when the recognizable
+    /// pool is thin. Lookups cache to disk, so repeat games cost nothing.
+    private func deezerUpgrade(_ tracks: [Track], difficulty: Difficulty) async -> [Track] {
+        var tracks = tracks
+        let recognizable = tracks.filter { $0.tier != .hard }.count
+        if difficulty != .hard && recognizable >= minEasyPool { return tracks }
+
+        let candidates = tracks.indices.filter { tracks[$0].tier == .hard }.shuffled()
+        let chosen = Array(candidates.prefix(deezerLookupBudget))
+        guard !chosen.isEmpty else { return tracks }
+
+        var upgraded = 0
+        for chunkStart in stride(from: 0, to: chosen.count, by: 8) {
+            let chunk = chosen[chunkStart..<min(chunkStart + 8, chosen.count)]
+            let ranks = await withTaskGroup(of: (Int, Int?).self, returning: [Int: Int].self) { group in
+                for index in chunk {
+                    let track = tracks[index]
+                    group.addTask {
+                        (index, await DeezerRankService.shared.rank(title: track.name, artist: track.artistName))
+                    }
+                }
+                var found: [Int: Int] = [:]
+                for await (index, rank) in group {
+                    if let rank { found[index] = rank }
+                }
+                return found
+            }
+            for (index, rank) in ranks {
+                let grade = DeezerRankService.shared.grade(forRank: rank)
+                if grade != .obscure {
+                    tracks[index].tier = tier(for: grade)
+                    upgraded += 1
+                }
+            }
+        }
+        DeezerRankService.shared.persistCache()
+        if upgraded > 0 { print("[MusicService] Deezer upgraded \(upgraded)/\(chosen.count) obscure tracks") }
+        return tracks
+    }
+
+    // MARK: - Queue assembly
+
+    /// Orders the graded pool for the chosen difficulty. Harder queues carry
+    /// challengers, but anchors are woven in so no window of three songs is
+    /// ever all-unrecognizable — the thing that kills a party.
+    private func assembleQueue(_ tracks: [Track], difficulty: Difficulty) -> [Track] {
+        let famous = tracks.filter { $0.tier == .easy }.shuffled()
+        let known = tracks.filter { $0.tier == .medium }.shuffled()
+        let obscure = tracks.filter { $0.tier == .hard }.shuffled()
+
+        switch difficulty {
+        case .easy:
+            var queue = famous
+            if queue.count < minEasyPool {
+                // Thin era/genre combo: pad with the most defensible knowns.
+                queue = (queue + known.prefix(minEasyPool - queue.count)).shuffled()
+                print("[MusicService] Easy pool thin (\(famous.count) famous); padded with \(queue.count - famous.count) known")
+            }
+            return Array(queue.prefix(maxQueueLength))
+        case .medium:
+            var queue = interleave(anchors: famous, others: known, maxOthersRun: 2)
+            if queue.count < minEasyPool {
+                queue += obscure.prefix(minEasyPool - queue.count)
+            }
+            return Array(queue.prefix(maxQueueLength))
+        case .hard:
+            var anchors = known
+            if anchors.count * 2 < obscure.count {
+                // Not enough knowns to anchor every third slot; promote hits.
+                anchors = (anchors + famous).shuffled()
+            }
+            return Array(interleave(anchors: anchors, others: obscure, maxOthersRun: 2).prefix(maxQueueLength))
+        }
+    }
+
+    /// Random weave of two pools, never allowing more than maxOthersRun
+    /// consecutive "others" while anchors remain.
+    private func interleave(anchors: [Track], others: [Track], maxOthersRun: Int) -> [Track] {
+        var anchors = anchors[...]
+        var others = others[...]
+        var out: [Track] = []
+        var run = 0
+        while !(anchors.isEmpty && others.isEmpty) {
+            let pickOther: Bool
+            if others.isEmpty {
+                pickOther = false
+            } else if anchors.isEmpty {
+                pickOther = true
+            } else if run >= maxOthersRun {
+                pickOther = false
+            } else {
+                pickOther = Double.random(in: 0..<1) < Double(others.count) / Double(others.count + anchors.count)
+            }
+            if pickOther {
+                out.append(others.removeFirst())
+                run += 1
+            } else {
+                out.append(anchors.removeFirst())
+                run = 0
+            }
+        }
+        return out
     }
 
     private func filterByDecades(_ tracks: [Track], decades: [String]) -> [Track] {
@@ -195,7 +384,8 @@ final class MusicService {
 
     // MARK: - Pool builders
 
-    /// Top-of-chart tracks for a genre, tiered easy/medium by rank.
+    /// Current top-of-chart tracks for a genre (chart order preserved; the
+    /// caller records ranks for grading).
     private func chartTracks(genre: String?) async -> [Track] {
         let cacheKey = "chart:\(genre ?? "all")"
         if let cached = chartCache[cacheKey] { return cached }
@@ -209,34 +399,12 @@ final class MusicService {
             do { tracks = try await itunesChartTracks(genre: genre) }
             catch { print("[MusicService] chart fetch failed for \(genre ?? "all"): \(error)") }
         }
-
-        tracks = tracks.enumerated().map { index, track in
-            var t = track
-            t.tier = index < easyChartCutoff ? .easy : .medium
-            return t
-        }
         chartCache[cacheKey] = tracks
         return tracks
     }
 
-    /// Album tracks that never charted, mined from chart artists — the 'hard' tier.
-    private func deepCuts(from chart: [Track]) async -> [Track] {
-        let chartIDs = Set(chart.map(\.id))
-        let sources = chart.shuffled().prefix(deepCutSources)
-        var cuts: [Track] = []
-        for source in sources {
-            guard let albumId = await albumId(for: source) else { continue }
-            let albumTracks = await tracksForAlbum(albumId)
-            let fresh = albumTracks.filter { $0.id != source.id && !chartIDs.contains($0.id) }
-            for var cut in fresh.shuffled().prefix(deepCutsPerAlbum) {
-                cut.tier = .hard
-                cuts.append(cut)
-            }
-        }
-        return cuts
-    }
-
-    /// Songs from a decade within a genre, tiered by search rank.
+    /// Songs from a decade within a genre, filtered by release year and
+    /// catalog genre label. Grading decides how recognizable each one is.
     private func decadeTracks(decade: String, genre: String?) async -> [Track] {
         let cacheKey = "decade:\(decade):\(genre ?? "all")"
         if let cached = searchCache[cacheKey] { return cached }
@@ -255,17 +423,199 @@ final class MusicService {
         }
 
         guard let range = Self.yearRange(for: decade) else { return [] }
-        var filtered = results.filter { track in
+        let filtered = results.filter { track in
             guard let year = track.releaseYear, year >= range.0, year <= range.1 else { return false }
             return matchesGenre(label: track.genreName, genre: genre)
         }
-        filtered = filtered.enumerated().map { index, track in
-            var t = track
-            t.tier = index < 40 ? .easy : (index < 120 ? .medium : .hard)
-            return t
-        }
         searchCache[cacheKey] = filtered
         return filtered
+    }
+
+    // MARK: - Essentials playlists (MusicKit only)
+
+    private struct EssentialsSpec {
+        let genre: String?   // nil = decade "Hits Essentials"
+        let decade: String?  // nil = all-time genre Essentials
+    }
+
+    /// Tracks from Apple's editorial Essentials playlists for the selection,
+    /// recording membership so grading can mark them famous/known.
+    private func essentialsTracks(genres: [String], decades: [String], context: inout GradingContext) async -> [Track] {
+        guard useMusicKit else { return [] }
+
+        var hitsSpecs: [EssentialsSpec] = decades.map { EssentialsSpec(genre: nil, decade: $0) }
+        if decades.isEmpty && !genres.isEmpty {
+            hitsSpecs = [] // genre-only games get genre Essentials below
+        }
+        var genreSpecs: [EssentialsSpec] = []
+        for genre in genres {
+            if decades.isEmpty {
+                genreSpecs.append(EssentialsSpec(genre: genre, decade: nil))
+            } else {
+                genreSpecs += decades.map { EssentialsSpec(genre: genre, decade: $0) }
+            }
+        }
+
+        let specs = (hitsSpecs + genreSpecs.shuffled()).prefix(essentialsBudget)
+        var collected: [Track] = []
+        for spec in specs {
+            var tracks = await essentialsPlaylistTracks(spec)
+            if let decade = spec.decade {
+                tracks = filterByDecades(tracks, decades: [decade])
+            }
+            if spec.genre == nil && !genres.isEmpty {
+                // Cross-genre hits playlist inside a genre-filtered game: keep
+                // only tracks whose label matches some selected genre.
+                tracks = tracks.filter { track in genres.contains { matchesGenre(label: track.genreName, genre: $0) } }
+            }
+            for track in tracks {
+                let key = songKey(track)
+                if spec.genre == nil {
+                    context.hitsEssentials.insert(key)
+                } else {
+                    context.genreEssentials.insert(key)
+                }
+            }
+            collected += tracks
+        }
+        return collected
+    }
+
+    private func essentialsPlaylistTracks(_ spec: EssentialsSpec) async -> [Track] {
+        let cacheKey = "ess:\(spec.genre ?? "hits"):\(spec.decade ?? "all")"
+        if let cached = essentialsCache[cacheKey] { return cached }
+
+        var tracks: [Track] = []
+        // Fast path: known decade Hits Essentials IDs.
+        if spec.genre == nil, let decade = spec.decade, let id = Self.decadeHitsPlaylistIDs[decade] {
+            tracks = await playlistTracks(id: id)
+        }
+        if tracks.isEmpty {
+            tracks = await searchEssentialsPlaylist(spec)
+        }
+        essentialsCache[cacheKey] = tracks
+        if !tracks.isEmpty {
+            print("[MusicService] Essentials \(cacheKey): \(tracks.count) tracks")
+        }
+        return tracks
+    }
+
+    private func playlistTracks(id: String) async -> [Track] {
+        guard useMusicKit else { return [] }
+        do {
+            var request = MusicCatalogResourceRequest<Playlist>(matching: \.id, equalTo: MusicItemID(id))
+            request.properties = [.tracks]
+            let response = try await request.response()
+            guard let items = response.items.first?.tracks else { return [] }
+            return items.compactMap { item in
+                if case .song(let song) = item { return mapSong(song) }
+                return nil
+            }
+        } catch {
+            demoteMusicKit(error)
+            return []
+        }
+    }
+
+    private func searchEssentialsPlaylist(_ spec: EssentialsSpec) async -> [Track] {
+        guard useMusicKit else { return [] }
+        let decadeToken = spec.decade.map { $0.count == 5 ? String($0.dropFirst(2)) : $0 } // "1980s" -> "80s"
+        let subject = spec.genre ?? "Hits"
+        let term = "\(decadeToken ?? "") \(subject) Essentials".trimmingCharacters(in: .whitespaces)
+        do {
+            var request = MusicCatalogSearchRequest(term: term, types: [Playlist.self])
+            request.limit = 25
+            let response = try await request.response()
+            let wanted = compact(subject)
+            let playlist = response.playlists.first { playlist in
+                guard (playlist.curatorName ?? "").lowercased().hasPrefix("apple music") else { return false }
+                let name = compact(playlist.name)
+                guard name.contains("essentials"), name.contains(wanted) else { return false }
+                if let decadeToken { return name.contains(compact(decadeToken)) }
+                return true
+            }
+            guard let playlist else { return [] }
+            let detailed = try await playlist.with(.tracks)
+            return (detailed.tracks ?? []).compactMap { item in
+                if case .song(let song) = item { return mapSong(song) }
+                return nil
+            }
+        } catch {
+            demoteMusicKit(error)
+            return []
+        }
+    }
+
+    /// Lowercased alphanumerics only — playlist names use styled apostrophes
+    /// and hyphens ("’80s", "Hip-Hop") that would break contains() checks.
+    private func compact(_ s: String) -> String {
+        String(s.lowercased().unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) })
+    }
+
+    // MARK: - Deep cuts (hard tier candidates)
+
+    /// Album tracks that were never hits, mined from recognizable artists in
+    /// the pool — "you know the artist, but which song is this?" material.
+    /// The artist's top songs and the fame database veto anything famous.
+    private func deepCuts(pool: [Track], context: inout GradingContext) async -> [Track] {
+        var seenArtists = Set<String>()
+        var sources: [Track] = []
+        for track in pool.shuffled() {
+            let key = songKey(track)
+            let recognizable = context.chartRank[key] != nil
+                || context.hitsEssentials.contains(key)
+                || context.genreEssentials.contains(key)
+                || FameDatabase.shared.lookup(title: track.name, artist: track.artistName)?.grade == .famous
+            guard recognizable else { continue }
+            if seenArtists.insert(FameDatabase.normalizeArtist(track.artistName)).inserted {
+                sources.append(track)
+            }
+            if sources.count >= deepCutSources { break }
+        }
+
+        var cuts: [Track] = []
+        for source in sources {
+            let artistNorm = FameDatabase.normalizeArtist(source.artistName)
+            let topKeys = await topSongKeys(artistName: source.artistName)
+            context.artistTop[artistNorm] = topKeys
+
+            guard let albumId = await albumId(for: source) else { continue }
+            let albumTracks = await tracksForAlbum(albumId)
+            let candidates = albumTracks.filter { candidate in
+                let key = songKey(candidate)
+                guard key != songKey(source), !topKeys.contains(key), context.chartRank[key] == nil else { return false }
+                let grade = FameDatabase.shared.lookup(title: candidate.name, artist: candidate.artistName)?.grade ?? .obscure
+                return grade == .obscure
+            }
+            cuts += candidates.shuffled().prefix(deepCutsPerAlbum)
+        }
+        return cuts
+    }
+
+    /// Ordered songKeys of the artist's ~20 most popular songs in this
+    /// storefront (Apple's own popularity ranking). Empty when unavailable.
+    private func topSongKeys(artistName: String) async -> [String] {
+        let norm = FameDatabase.normalizeArtist(artistName)
+        guard !norm.isEmpty else { return [] }
+        if let cached = topSongsCache[norm] { return cached }
+        guard useMusicKit else { return [] }
+
+        var keys: [String] = []
+        do {
+            var request = MusicCatalogSearchRequest(term: artistName, types: [Artist.self])
+            request.limit = 5
+            let response = try await request.response()
+            let artist = response.artists.first { FameDatabase.normalizeArtist($0.name) == norm }
+                ?? response.artists.first
+            if let artist {
+                let detailed = try await artist.with(.topSongs)
+                keys = (detailed.topSongs ?? []).map { songKey(mapSong($0)) }
+            }
+        } catch {
+            demoteMusicKit(error)
+        }
+        topSongsCache[norm] = keys
+        return keys
     }
 
     private func tracksForAlbum(_ albumId: String) async -> [Track] {
