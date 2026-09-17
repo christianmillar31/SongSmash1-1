@@ -99,6 +99,9 @@ struct GameSettings {
     var decades: [String] = []
     var difficulty: Difficulty = .medium
     var targetScore: Int = 25
+    // On by default: this is a game for a room, and the catalog will happily
+    // serve a slur in a song title to someone's parents otherwise.
+    var familyFriendly: Bool = true
     var teams: [Team] = []
 }
 
@@ -218,6 +221,7 @@ private struct SavedSetup: Codable {
     var decades: [String]
     var difficulty: String
     var targetScore: Int
+    var familyFriendly: Bool?
 
     private static let key = "SavedGameSetup"
 
@@ -227,7 +231,8 @@ private struct SavedSetup: Codable {
             genres: settings.genres,
             decades: settings.decades,
             difficulty: settings.difficulty.rawValue,
-            targetScore: settings.targetScore
+            targetScore: settings.targetScore,
+            familyFriendly: settings.familyFriendly
         )
         if let data = try? JSONEncoder().encode(snapshot) {
             UserDefaults.standard.set(data, forKey: key)
@@ -243,6 +248,7 @@ private struct SavedSetup: Codable {
         settings.decades = snapshot.decades
         settings.difficulty = Difficulty(rawValue: snapshot.difficulty) ?? .medium
         settings.targetScore = snapshot.targetScore
+        settings.familyFriendly = snapshot.familyFriendly ?? true
         return settings
     }
 }
@@ -256,7 +262,10 @@ class GameManager: ObservableObject {
     @Published var showAnswer = false
     @Published var availableTracks: [Track] = []
     @Published var isLoadingTracks = false
+    @Published var isToppingUp = false
     @Published var loadError: String?
+    /// The setlist ran out before anyone reached the target score.
+    @Published var endedEarly = false
 
     private var cancellables = Set<AnyCancellable>()
 
@@ -349,11 +358,14 @@ class GameManager: ObservableObject {
     func loadTracks() async {
         isLoadingTracks = true
         loadError = nil
+        endedEarly = false
         do {
             availableTracks = try await MusicService.shared.loadTracks(
                 genres: gameSettings.genres,
                 decades: gameSettings.decades,
-                difficulty: gameSettings.difficulty
+                difficulty: gameSettings.difficulty,
+                targetScore: gameSettings.targetScore,
+                familyFriendly: gameSettings.familyFriendly
             )
             print("Loaded \(availableTracks.count) tracks for game")
             if availableTracks.isEmpty {
@@ -364,6 +376,30 @@ class GameManager: ObservableObject {
             loadError = "Couldn't build your setlist. Check your connection and try again."
         }
         isLoadingTracks = false
+    }
+
+    /// Fetches more songs while a game is still running, so a long game ends on
+    /// the scoreboard rather than because the setlist ran dry.
+    /// Returns true when at least one new song was added.
+    @MainActor
+    @discardableResult
+    func topUpTracks() async -> Bool {
+        guard !isToppingUp else { return false }
+        isToppingUp = true
+        defer { isToppingUp = false }
+        let known = Set(availableTracks.map(\.id))
+        let more = (try? await MusicService.shared.loadTracks(
+            genres: gameSettings.genres,
+            decades: gameSettings.decades,
+            difficulty: gameSettings.difficulty,
+            targetScore: gameSettings.targetScore,
+            familyFriendly: gameSettings.familyFriendly,
+            continuing: true
+        )) ?? []
+        let additions = more.filter { !known.contains($0.id) && !MusicService.shared.shouldSkipTrack($0) }
+        availableTracks += additions
+        print("Topped up setlist with \(additions.count) tracks")
+        return !additions.isEmpty
     }
 }
 
@@ -627,6 +663,10 @@ struct ContentView: View {
 #if DEBUG
             // Dev shortcut: `-AutoDemo YES` launch argument seeds a demo game and
             // exercises the real discovery + playback path without any taps.
+            if UserDefaults.standard.string(forKey: "SimulateBeta") != nil {
+                Task { await MusicService.shared.debugSimulateBeta() }
+                return
+            }
             if UserDefaults.standard.bool(forKey: "AutoDemo"), gameManager.gameSettings.teams.isEmpty {
                 gameManager.gameSettings.teams = [
                     Team(name: "The Bears", colorName: "blue"),
@@ -720,9 +760,16 @@ struct GameSetupView: View {
                 musicSection
                 difficultySection
                 targetScoreSection
+                familyFriendlySection
 
                 if let error = gameManager.loadError {
                     errorBox(error)
+                }
+
+                if let note = MusicService.shared.catalogNote {
+                    Text(note)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
 
                 PrimaryButton(
@@ -914,6 +961,27 @@ struct GameSetupView: View {
                     }
                 }
             }
+        }
+    }
+
+    private var familyFriendlySection: some View {
+        HStack(alignment: .firstTextBaseline) {
+            VStack(alignment: .leading, spacing: 2) {
+                sectionLabel("FAMILY FRIENDLY")
+                Text("Skips songs marked explicit")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            Spacer()
+            Toggle("", isOn: Binding(
+                get: { gameManager.gameSettings.familyFriendly },
+                set: { isOn in
+                    Haptics.tap()
+                    gameManager.gameSettings.familyFriendly = isOn
+                }
+            ))
+            .labelsHidden()
+            .tint(DesignSystem.colors.primary)
         }
     }
 
@@ -1512,27 +1580,40 @@ struct GamePlayView: View {
             return
         }
 
-        // Find the next unplayed track in the queue
-        var nextTrack: Track?
-        for track in gameManager.availableTracks where !MusicService.shared.shouldSkipTrack(track) {
-            nextTrack = track
-            break
-        }
+        let remaining = gameManager.availableTracks.filter { !MusicService.shared.shouldSkipTrack($0) }
 
-        if let track = nextTrack {
-            MusicService.shared.markTrackAsPlayed(track)
-            playerManager.playSong(track) { success in
-                if success {
-                    gameManager.nextRound(title: track.name, artist: track.artistName)
-                    gameManager.gameState = .playing
+        if let track = remaining.first {
+            // Running low: fetch the next batch in the background so the hand-off
+            // is invisible to the room.
+            if remaining.count <= 6 {
+                Task { await gameManager.topUpTracks() }
+            }
+            play(track)
+        } else {
+            // Out of songs mid-game: try once for more before calling it.
+            Task {
+                if await gameManager.topUpTracks(),
+                   let track = gameManager.availableTracks.first(where: { !MusicService.shared.shouldSkipTrack($0) }) {
+                    play(track)
                 } else {
-                    print("Failed to play track: \(track.name)")
+                    print("No more tracks available")
+                    playerManager.stopPlayback()
+                    gameManager.endedEarly = true
+                    gameManager.endGame()
                 }
             }
-        } else {
-            print("No more tracks available")
-            playerManager.stopPlayback()
-            gameManager.endGame()
+        }
+    }
+
+    private func play(_ track: Track) {
+        MusicService.shared.markTrackAsPlayed(track)
+        playerManager.playSong(track) { success in
+            if success {
+                gameManager.nextRound(title: track.name, artist: track.artistName)
+                gameManager.gameState = .playing
+            } else {
+                print("Failed to play track: \(track.name)")
+            }
         }
     }
 }
@@ -1595,6 +1676,14 @@ struct GameFinishedView: View {
                 }
 
                 Spacer()
+
+                if gameManager.endedEarly {
+                    Text("RAN OUT OF SONGS FOR THIS MIX")
+                        .font(.caption.weight(.heavy))
+                        .tracking(1)
+                        .foregroundColor(.black.opacity(0.55))
+                        .padding(.bottom, DesignSystem.spacing.xs)
+                }
 
                 VStack(spacing: DesignSystem.spacing.sm) {
                     Button(action: rematch) {

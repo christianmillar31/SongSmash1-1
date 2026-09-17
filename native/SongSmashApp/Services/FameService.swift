@@ -122,7 +122,10 @@ final class FameDatabase {
 // famous album cuts and international hits that never charted in the US.
 // Results are cached on disk forever, so repeat games cost no requests, and
 // any network failure just leaves the local grade standing.
-final class DeezerRankService {
+// An actor, not a class: lookups run eight at a time from a task group, and a
+// plain Swift dictionary mutated from parallel tasks corrupts its storage and
+// takes the app down mid-game (hard games always run this pass).
+actor DeezerRankService {
     static let shared = DeezerRankService()
 
     static let famousThreshold = 800_000
@@ -153,7 +156,7 @@ final class DeezerRankService {
         cacheDirty = false
     }
 
-    func grade(forRank rank: Int) -> FameGrade {
+    nonisolated func grade(forRank rank: Int) -> FameGrade {
         if rank >= Self.famousThreshold { return .famous }
         if rank >= Self.knownThreshold { return .known }
         return .obscure
