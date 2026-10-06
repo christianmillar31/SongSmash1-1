@@ -917,6 +917,40 @@ final class MusicService {
     private var debugForceITunes = false
 #endif
 
+    /// Prompt-free check of whether the full Apple Music catalog can serve, run
+    /// when the setup screen opens. The real prompt waits for START, so before
+    /// this a tester had to finish a game to learn anything at all.
+    @discardableResult
+    func refreshCatalogStatus() async -> String? {
+        switch MusicAuthorization.currentStatus {
+        case .authorized:
+            catalogNote = nil
+        case .denied:
+            catalogNote = "Apple Music access is off for SongSmash, so songs come from the smaller iTunes catalog. Turn it on in Settings › Privacy & Security › Media & Apple Music."
+        case .restricted:
+            // Screen Time hides the app from the Media & Apple Music list
+            // entirely, which looks exactly like "the app never asked".
+            catalogNote = "Apple Music is restricted on this iPhone (Screen Time › Content & Privacy Restrictions › Media & Apple Music), so songs come from the smaller iTunes catalog."
+        case .notDetermined:
+            // Token OK means iOS will ask for access when the first game starts.
+            do {
+                _ = try await DefaultMusicTokenProvider().developerToken(options: [])
+                catalogNote = nil
+            } catch {
+                catalogNote = Self.tokenFailureNote(error)
+            }
+        @unknown default:
+            break
+        }
+        return catalogNote
+    }
+
+    private static func tokenFailureNote(_ error: Error) -> String {
+        // The enum case (String(describing:)) is what's diagnosable;
+        // localizedDescription for MusicKit errors is often just "couldn't complete".
+        "Apple Music catalog unavailable on this device: \(String(describing: error))"
+    }
+
     /// Triggers the one-time system prompt. Any outcome other than .authorized
     /// simply leaves the iTunes fallback serving. Retried on every queue build:
     /// a developer token that fails once (no network at launch) must not cost
@@ -939,7 +973,7 @@ final class MusicService {
             }
             // Surfaced in the setup screen so a tester can report the real
             // reason instead of just seeing a thin, odd-looking setlist.
-            catalogNote = "Apple Music catalog unavailable on this device (\(error.localizedDescription))."
+            catalogNote = Self.tokenFailureNote(error)
             print("[MusicService] developer token failed: \(error)")
             demoteMusicKit(error)
             return

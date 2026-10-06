@@ -3,6 +3,7 @@ import UIKit
 import AVFoundation
 import Network
 import Combine
+import StoreKit
 
 // MARK: - App Main
 @main
@@ -57,6 +58,31 @@ enum Haptics {
     static func score() { UIImpactFeedbackGenerator(style: .medium).impactOccurred() }
     static func reveal() { UIImpactFeedbackGenerator(style: .heavy).impactOccurred() }
     static func celebrate() { UINotificationFeedbackGenerator().notificationOccurred(.success) }
+}
+
+// MARK: - Review Prompt
+// Asks for an App Store rating at the high point of the night — a winner just
+// crowned — once a group has come back for a second game, and at most once per
+// app version. Never after a game that ran out of songs. iOS separately caps
+// the system sheet at three showings a year, so this only picks the moment.
+enum ReviewPrompt {
+    private static let finishedGamesKey = "FinishedGames"
+    private static let askedVersionKey = "ReviewRequestedForVersion"
+    private static let minimumFinishedGames = 2
+
+    /// Counts a finished game; returns true when now is the moment to ask.
+    static func recordFinishedGame(endedEarly: Bool) -> Bool {
+        let defaults = UserDefaults.standard
+        let finished = defaults.integer(forKey: finishedGamesKey) + 1
+        defaults.set(finished, forKey: finishedGamesKey)
+
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
+        guard !endedEarly,
+              finished >= minimumFinishedGames,
+              defaults.string(forKey: askedVersionKey) != version else { return false }
+        defaults.set(version, forKey: askedVersionKey)
+        return true
+    }
 }
 
 // MARK: - Models
@@ -748,6 +774,9 @@ struct GameSetupView: View {
     @State private var showingTeamSetup = UserDefaults.standard.bool(forKey: "ShowTeamSetup")
     @State private var showingMusicSheet = false
     @State private var editingTeam: Team?
+    // Mirrors MusicService.catalogNote; @State so the result of the on-open
+    // check re-renders the screen.
+    @State private var catalogNote: String? = MusicService.shared.catalogNote
 
     var body: some View {
         ScrollView {
@@ -766,10 +795,11 @@ struct GameSetupView: View {
                     errorBox(error)
                 }
 
-                if let note = MusicService.shared.catalogNote {
+                if let note = catalogNote {
                     Text(note)
                         .font(.caption)
                         .foregroundColor(.secondary)
+                        .textSelection(.enabled) // so a tester can copy the exact error
                 }
 
                 PrimaryButton(
@@ -791,6 +821,13 @@ struct GameSetupView: View {
         }
         .sheet(isPresented: $showingMusicSheet) {
             MusicSelectionSheet()
+        }
+        .task {
+            catalogNote = await MusicService.shared.refreshCatalogStatus()
+        }
+        .onChange(of: gameManager.isLoadingTracks) { _, loading in
+            // A queue build can learn something new (a failure mid-build).
+            if !loading { catalogNote = MusicService.shared.catalogNote }
         }
     }
 
@@ -1624,6 +1661,7 @@ struct GamePlayView: View {
 struct GameFinishedView: View {
     @EnvironmentObject var gameManager: GameManager
     @EnvironmentObject var playerManager: PlayerManager
+    @Environment(\.requestReview) private var requestReview
     @State private var scoreScale = 0.5
 
     var sortedTeams: [Team] {
@@ -1732,6 +1770,10 @@ struct GameFinishedView: View {
             Haptics.celebrate()
             withAnimation(.spring(response: 0.6, dampingFraction: 0.55).delay(0.15)) {
                 scoreScale = 1.0
+            }
+            if ReviewPrompt.recordFinishedGame(endedEarly: gameManager.endedEarly) {
+                // Let the winner moment land before the system sheet covers it.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { requestReview() }
             }
         }
     }

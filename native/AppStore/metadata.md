@@ -1,7 +1,11 @@
 # SongSmash — App Store Connect metadata
 
-AS SUBMITTED for v1.0 (2026-08-22, build 4, WAITING_FOR_REVIEW). App Store
-Connect is the source of truth; this file mirrors it. Promotional text ends
+AS SUBMITTED for v1.3 (2026-10-05, build 7). App Store Connect is the source
+of truth; this file mirrors it. Name, subtitle and keywords were reworked for
+search in 1.3: through 1.2 the live name was plain "SongSmash" (not the name
+below that 1.0 was drafted with), and "SongSmash" itself searched at #30 with
+no showing for any generic phrase. Keep trademarked names ("Heardle", "Name
+That Tune" as a phrase) out of every field — guideline 2.3.7. Promotional text ends
 "First team to the target score wins the night." Support URL:
 https://christianmillar31.github.io/SongSmash1-1/ — Privacy policy URL:
 https://christianmillar31.github.io/SongSmash1-1/privacy.html — Copyright:
@@ -10,11 +14,11 @@ declared non-trader; price Free worldwide; iPhone-only.
 
 ## App name (30 chars max)
 
-SongSmash: Music Party Game
+SongSmash: Guess the Song
 
 ## Subtitle (30 chars max)
 
-Guess the song. Race to 25.
+Music Trivia Party Game
 
 ## Promotional text (170 chars max, editable without review)
 
@@ -58,7 +62,10 @@ Turn the volume up. Someone at the table knows this one.
 
 ## Keywords (100 chars max, comma-separated, no spaces)
 
-music,trivia,party,game,song,quiz,guess,team,name,that,tune,heardle,family,night,charades
+quiz,name,that,tune,family,night,friends,team,hits,oldies,throwback,60s,70s,80s,90s,rock,pop,country
+
+(Exactly 100 bytes. Never repeat a word already in the name or subtitle —
+Apple indexes those fields itself, so a repeat is a wasted slot.)
 
 ## Category
 
