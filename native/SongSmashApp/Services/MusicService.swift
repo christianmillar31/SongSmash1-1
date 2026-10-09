@@ -1,5 +1,4 @@
 import Foundation
-import MusicKit
 
 // MARK: - Track Model (Apple catalog)
 struct Track: Codable, Hashable, Identifiable {
@@ -25,15 +24,12 @@ struct Track: Codable, Hashable, Identifiable {
 // MARK: - Music Service
 // Discovery + previews from Apple's catalog. Replaces the removed Spotify APIs.
 // Two backends sharing the same catalog and genre IDs:
-//  - MusicKit (preferred): Apple's supported framework, automatic developer
-//    token, documented rate limits, storefront follows the device region.
-//    Requires the MusicKit app service to be enabled for this App ID in the
-//    developer portal; until then every request 401s and we fall back.
-//  - iTunes Search/RSS (itunes.apple.com), keyless fallback. Rate-limited
-//    (~20 req/min); the per-game queue build stays well under it.
-// Catalog-only: no Apple Music subscription needed, but MusicKit requires the
-// one-time MusicAuthorization prompt (it refuses even catalog requests while
-// status is .notDetermined). Declining just means the iTunes fallback serves.
+//  - Apple Music web API (preferred): api.music.apple.com with our own
+//    developer token (AppleMusicToken). Catalog endpoints need nothing from
+//    the player — no permission prompt, no subscription — so every player
+//    gets the full catalog, editorial playlists included.
+//  - iTunes Search/RSS (itunes.apple.com), keyless fallback for when no token
+//    can be loaded. Rate-limited (~20 req/min); a queue build stays under it.
 //
 // Difficulty pipeline (no API exposes a song popularity number, so fame is
 // assembled from layered signals):
@@ -53,13 +49,16 @@ final class MusicService {
         case easy, medium, hard
     }
 
-    private let storefront = "us" // iTunes fallback only; MusicKit picks its own
+    private let storefront = "us" // iTunes fallback only
 
-    // MusicKit health. Failures are counted per queue build, never latched for
-    // the life of the app: one timeout on party wifi used to drop every later
-    // game in the session onto the thinner iTunes catalog.
-    private var musicKitFailures = 0
-    private var musicKitOffForBuild = false
+    // Apple Music API state. Failures are counted per queue build, never
+    // latched for the life of the app: one timeout on party wifi used to drop
+    // every later game in the session onto the thinner iTunes catalog.
+    private var appleMusicToken: String?
+    private var appleMusicStorefront = "us"
+    private var storefrontResolved = false
+    private var appleMusicFailures = 0
+    private var appleMusicOffForBuild = false
     /// What the last build actually ran on, for the setup screen's footnote.
     private(set) var usingFallbackCatalog = false
     private(set) var catalogNote: String?
@@ -169,10 +168,10 @@ final class MusicService {
         continuing: Bool = false
     ) async throws -> [Track] {
         if !continuing { playedTrackIDs.removeAll() }
-        musicKitFailures = 0
-        musicKitOffForBuild = false
-        catalogNote = nil // may be replaced with a specific reason below
-        await ensureMusicKitAuthorization()
+        appleMusicFailures = 0
+        appleMusicOffForBuild = false
+        appleMusicToken = await AppleMusicToken.shared.current()
+        await resolveStorefront()
 
         let genreList = genres.filter { Self.genreIDs[$0] != nil }
         // No genres selected = all music: the overall charts (genre nil).
@@ -227,15 +226,9 @@ final class MusicService {
         let assembled = assembleQueue(queue, difficulty: difficulty, balanceDecades: genreList.isEmpty && decades.isEmpty, limit: needed)
         let famous = queue.filter { $0.tier == .easy }.count
         let known = queue.filter { $0.tier == .medium }.count
-        usingFallbackCatalog = !useMusicKit
-        if !usingFallbackCatalog {
-            catalogNote = nil
-        } else if catalogNote == nil {
-            catalogNote = MusicAuthorization.currentStatus == .authorized
-                ? "Apple Music catalog unavailable — using the smaller iTunes catalog."
-                : "Apple Music access is off, so songs come from the smaller iTunes catalog."
-        }
-        print("[MusicService] Queue \(assembled.count)/\(queue.count) tracks (fame \(famous)F/\(known)K/\(queue.count - famous - known)O, need \(needed), musicKit=\(useMusicKit)) for genres=\(genreList.isEmpty ? ["All"] : genreList) decades=\(decades) difficulty=\(difficulty.rawValue)")
+        usingFallbackCatalog = !useAppleMusic
+        catalogNote = usingFallbackCatalog ? Self.fallbackCatalogNote : nil
+        print("[MusicService] Queue \(assembled.count)/\(queue.count) tracks (fame \(famous)F/\(known)K/\(queue.count - famous - known)O, need \(needed), appleMusic=\(useAppleMusic)) for genres=\(genreList.isEmpty ? ["All"] : genreList) decades=\(decades) difficulty=\(difficulty.rawValue)")
 #if DEBUG
         debugReport(assembled, raw: pool.count, deduped: dedupeSongs(pool).count, fresh: queue.count)
 #endif
@@ -628,9 +621,9 @@ final class MusicService {
 
         var tracks: [Track] = []
         var fetched = false
-        if useMusicKit {
-            do { tracks = try await musicKitChartTracks(genre: genre); fetched = true }
-            catch { demoteMusicKit(error) }
+        if useAppleMusic {
+            do { tracks = try await appleMusicChartTracks(genre: genre); fetched = true }
+            catch { demoteAppleMusic(error) }
         }
         if tracks.isEmpty {
             do { tracks = try await itunesChartTracks(genre: genre); fetched = true }
@@ -654,9 +647,9 @@ final class MusicService {
 
         var results: [Track] = []
         var fetched = false
-        if useMusicKit {
-            do { results = try await musicKitSearchTracks(term: term); fetched = true }
-            catch { demoteMusicKit(error) }
+        if useAppleMusic {
+            do { results = try await appleMusicSearchTracks(term: term); fetched = true }
+            catch { demoteAppleMusic(error) }
         }
         if results.isEmpty {
             do { results = try await itunesSearchTracks(term: term); fetched = true }
@@ -676,7 +669,7 @@ final class MusicService {
         return filtered
     }
 
-    // MARK: - Essentials playlists (MusicKit only)
+    // MARK: - Essentials playlists (Apple Music only)
 
     private struct EssentialsSpec {
         let genre: String?   // nil = decade "Hits Essentials"
@@ -686,7 +679,7 @@ final class MusicService {
     /// Tracks from Apple's editorial Essentials playlists for the selection,
     /// recording membership so grading can mark them famous/known.
     private func essentialsTracks(genres: [String], decades: [String], context: inout GradingContext) async -> [Track] {
-        guard useMusicKit else { return [] }
+        guard useAppleMusic else { return [] }
 
         var hitsSpecs: [EssentialsSpec] = decades.map { EssentialsSpec(genre: nil, decade: $0) }
         if decades.isEmpty {
@@ -762,47 +755,32 @@ final class MusicService {
     }
 
     private func playlistTracks(id: String) async -> [Track] {
-        guard useMusicKit else { return [] }
-        do {
-            var request = MusicCatalogResourceRequest<Playlist>(matching: \.id, equalTo: MusicItemID(id))
-            request.properties = [.tracks]
-            let response = try await request.response()
-            guard let items = response.items.first?.tracks else { return [] }
-            return items.compactMap { item in
-                if case .song(let song) = item { return mapSong(song) }
-                return nil
-            }
-        } catch {
-            demoteMusicKit(error)
-            return []
-        }
+        guard useAppleMusic else { return [] }
+        do { return try await appleMusicPlaylistTracks(id: id) }
+        catch { demoteAppleMusic(error); return [] }
     }
 
     private func searchEssentialsPlaylist(_ spec: EssentialsSpec) async -> [Track] {
-        guard useMusicKit else { return [] }
+        guard useAppleMusic else { return [] }
         let decadeToken = spec.decade.map { $0.count == 5 ? String($0.dropFirst(2)) : $0 } // "1980s" -> "80s"
         let subject = spec.genre ?? "Hits"
         let term = "\(decadeToken ?? "") \(subject) Essentials".trimmingCharacters(in: .whitespaces)
         do {
-            var request = MusicCatalogSearchRequest(term: term, types: [Playlist.self])
-            request.limit = 25
-            let response = try await request.response()
+            let response = try await appleMusicGET("/search", ["term": term, "types": "playlists", "limit": "25"])
+            let playlists = results(response, "playlists")
             // Exact name match only. "contains" also accepted "'60s Italian Pop
             // Essentials" and "K-Pop Essentials", which is how Italian pop
             // turned up in a US 60s/70s rock game.
             let wanted = compact((decadeToken ?? "") + subject + "Essentials")
-            let playlist = response.playlists.first { playlist in
-                guard (playlist.curatorName ?? "").lowercased().hasPrefix("apple music") else { return false }
-                return compact(playlist.name) == wanted
+            let playlist = playlists.first { playlist in
+                let attributes = playlist["attributes"] as? [String: Any]
+                guard ((attributes?["curatorName"] as? String) ?? "").lowercased().hasPrefix("apple music") else { return false }
+                return compact(attributes?["name"] as? String ?? "") == wanted
             }
-            guard let playlist else { return [] }
-            let detailed = try await playlist.with(.tracks)
-            return (detailed.tracks ?? []).compactMap { item in
-                if case .song(let song) = item { return mapSong(song) }
-                return nil
-            }
+            guard let id = playlist?["id"] as? String else { return [] }
+            return try await appleMusicPlaylistTracks(id: id)
         } catch {
-            demoteMusicKit(error)
+            demoteAppleMusic(error)
             return []
         }
     }
@@ -859,21 +837,21 @@ final class MusicService {
         let norm = FameDatabase.normalizeArtist(artistName)
         guard !norm.isEmpty else { return [] }
         if let cached = topSongsCache[norm] { return cached }
-        guard useMusicKit else { return [] }
+        guard useAppleMusic else { return [] }
 
         var keys: [String] = []
         do {
-            var request = MusicCatalogSearchRequest(term: artistName, types: [Artist.self])
-            request.limit = 5
-            let response = try await request.response()
-            let artist = response.artists.first { FameDatabase.normalizeArtist($0.name) == norm }
-                ?? response.artists.first
-            if let artist {
-                let detailed = try await artist.with(.topSongs)
-                keys = (detailed.topSongs ?? []).map { songKey(mapSong($0)) }
+            let response = try await appleMusicGET("/search", ["term": artistName, "types": "artists", "limit": "5"])
+            let artists = results(response, "artists")
+            let artist = artists.first {
+                FameDatabase.normalizeArtist((($0["attributes"] as? [String: Any])?["name"] as? String) ?? "") == norm
+            } ?? artists.first
+            if let id = artist?["id"] as? String {
+                let top = try await appleMusicGET("/artists/\(id)/view/top-songs", ["limit": "20"])
+                keys = songs(in: top["data"]).map(songKey)
             }
         } catch {
-            demoteMusicKit(error)
+            demoteAppleMusic(error)
         }
         topSongsCache[norm] = keys
         return keys
@@ -882,9 +860,9 @@ final class MusicService {
     private func tracksForAlbum(_ albumId: String) async -> [Track] {
         if let cached = albumCache[albumId] { return cached }
         var tracks: [Track] = []
-        if useMusicKit {
-            do { tracks = try await musicKitAlbumTracks(albumId: albumId) }
-            catch { demoteMusicKit(error) }
+        if useAppleMusic {
+            do { tracks = try await appleMusicAlbumTracks(albumId: albumId) }
+            catch { demoteAppleMusic(error) }
         }
         if tracks.isEmpty {
             do { tracks = try await itunesAlbumTracks(albumId: albumId) }
@@ -894,190 +872,173 @@ final class MusicService {
         return tracks
     }
 
-    /// MusicKit chart songs don't carry their album relationship inline;
-    /// resolve it on demand (only needed when mining deep cuts for hard mode).
+    /// Chart and search songs don't carry their album inline; resolve it on
+    /// demand (only needed when mining deep cuts for hard mode).
     private func albumId(for track: Track) async -> String? {
         if let albumId = track.albumId { return albumId }
-        guard useMusicKit else { return nil }
-        do { return try await musicKitAlbumId(forSongId: track.id) }
-        catch { demoteMusicKit(error); return nil }
+        guard useAppleMusic else { return nil }
+        do { return try await appleMusicAlbumId(forSongId: track.id) }
+        catch { demoteAppleMusic(error); return nil }
     }
 
-    // MARK: - MusicKit backend
+    // MARK: - Apple Music API backend
 
-    // Authorization is re-checked per queue build (not latched), so granting
-    // access later in Settings upgrades the next game without a relaunch.
-    private var useMusicKit: Bool {
+    private static let appleMusicBase = "https://api.music.apple.com/v1"
+
+    private static let fallbackCatalogNote =
+        "Couldn't reach the Apple Music catalog right now, so songs come from the smaller iTunes catalog."
+
+    private var useAppleMusic: Bool {
 #if DEBUG
         if debugForceITunes { return false }
 #endif
-        return !musicKitOffForBuild && MusicAuthorization.currentStatus == .authorized
+        return appleMusicToken != nil && !appleMusicOffForBuild
     }
 #if DEBUG
     private var debugForceITunes = false
 #endif
 
-    /// Prompt-free check of whether the full Apple Music catalog can serve, run
-    /// when the setup screen opens. The real prompt waits for START, so before
-    /// this a tester had to finish a game to learn anything at all.
+    /// Run when the setup screen opens, so anyone can see which catalog will
+    /// serve before starting a game. Prompts for nothing.
     @discardableResult
     func refreshCatalogStatus() async -> String? {
-        switch MusicAuthorization.currentStatus {
-        case .authorized:
-            catalogNote = nil
-        case .denied:
-            catalogNote = "Apple Music access is off for SongSmash, so songs come from the smaller iTunes catalog. Turn it on in Settings › Privacy & Security › Media & Apple Music."
-        case .restricted:
-            // Screen Time hides the app from the Media & Apple Music list
-            // entirely, which looks exactly like "the app never asked".
-            catalogNote = "Apple Music is restricted on this iPhone (Screen Time › Content & Privacy Restrictions › Media & Apple Music), so songs come from the smaller iTunes catalog."
-        case .notDetermined:
-            // Token OK means iOS will ask for access when the first game starts.
-            do {
-                _ = try await DefaultMusicTokenProvider().developerToken(options: [])
-                catalogNote = nil
-            } catch {
-                catalogNote = Self.tokenFailureNote(error)
-            }
-        @unknown default:
-            break
-        }
+        catalogNote = await AppleMusicToken.shared.current() == nil ? Self.fallbackCatalogNote : nil
         return catalogNote
     }
 
-    private static func tokenFailureNote(_ error: Error) -> String {
-        // The enum case (String(describing:)) is what's diagnosable;
-        // localizedDescription for MusicKit errors is often just "couldn't complete".
-        "Apple Music catalog unavailable on this device: \(String(describing: error))"
-    }
-
-    /// Triggers the one-time system prompt. Any outcome other than .authorized
-    /// simply leaves the iTunes fallback serving. Retried on every queue build:
-    /// a developer token that fails once (no network at launch) must not cost
-    /// the player the full catalog for the rest of the night.
-    private func ensureMusicKitAuthorization() async {
-        guard MusicAuthorization.currentStatus == .notDetermined else { return }
-        // Apple's dialog is all-or-nothing ("music and video activity", "media
-        // library") even though we only read the public catalog. Don't show it
-        // unless MusicKit can actually serve: while the MusicKit app service
-        // isn't enabled for this App ID, the developer token fails and every
-        // request would 401 into the iTunes fallback anyway.
-        do {
-            _ = try await DefaultMusicTokenProvider().developerToken(options: [])
-        } catch {
-            // A failed token can stick in the cache; force one fresh attempt
-            // before writing the catalog off for this build.
-            if (try? await DefaultMusicTokenProvider().developerToken(options: .ignoreCache)) != nil {
-                _ = await MusicAuthorization.request()
-                return
-            }
-            // Surfaced in the setup screen so a tester can report the real
-            // reason instead of just seeing a thin, odd-looking setlist.
-            catalogNote = Self.tokenFailureNote(error)
-            print("[MusicService] developer token failed: \(error)")
-            demoteMusicKit(error)
-            return
-        }
-        let status = await MusicAuthorization.request()
-        if status != .authorized {
-            print("[MusicService] Apple Music access not granted (\(status)); using iTunes catalog")
-        }
-    }
-
-    private var genreCache: [Int: Genre] = [:]
-
-    /// Counts MusicKit failures within one queue build. A couple of dropped
+    /// Counts Apple Music failures within one queue build. A couple of dropped
     /// requests are normal on party wifi and are simply retried next build;
     /// only a build that keeps failing switches to iTunes, and only for itself.
-    private func demoteMusicKit(_ error: Error) {
-        musicKitFailures += 1
-        guard !musicKitOffForBuild else { return }
-        print("[MusicService] MusicKit request failed (\(musicKitFailures)): \(error)")
-        if musicKitFailures >= 3 {
-            musicKitOffForBuild = true
-            print("[MusicService] MusicKit failing repeatedly; using iTunes for this queue only")
+    private func demoteAppleMusic(_ error: Error) {
+        appleMusicFailures += 1
+        guard !appleMusicOffForBuild else { return }
+        print("[MusicService] Apple Music request failed (\(appleMusicFailures)): \(error)")
+        if appleMusicFailures >= 3 {
+            appleMusicOffForBuild = true
+            print("[MusicService] Apple Music failing repeatedly; using iTunes for this queue only")
         }
     }
 
-    private static let releaseDateFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd"
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(identifier: "UTC")
-        return formatter
-    }()
+    private enum AppleMusicError: Error {
+        case http(Int)
+    }
 
-    private func mapSong(_ song: Song) -> Track {
-        Track(
-            id: song.id.rawValue,
-            name: song.title,
-            artistName: song.artistName,
-            albumName: song.albumTitle ?? "",
-            albumId: song.albums?.first?.id.rawValue,
-            artworkUrl: song.artwork?.url(width: 300, height: 300)?.absoluteString,
-            releaseDate: song.releaseDate.map { Self.releaseDateFormatter.string(from: $0) },
-            previewUrl: song.previewAssets?.first?.url?.absoluteString,
-            externalUrl: song.url?.absoluteString,
-            genreName: song.genreNames.first,
-            isExplicit: song.contentRating == .explicit
+    /// GET against the catalog in the player's storefront. A missing resource
+    /// (a playlist Apple retired) comes back empty instead of throwing, so it
+    /// doesn't count against the backend's health.
+    private func appleMusicGET(_ path: String, _ query: [String: String] = [:]) async throws -> [String: Any] {
+        guard let token = appleMusicToken else { throw AppleMusicError.http(401) }
+        var components = URLComponents(string: "\(Self.appleMusicBase)/catalog/\(appleMusicStorefront)\(path)")!
+        if !query.isEmpty {
+            components.queryItems = query.sorted { $0.key < $1.key }.map { URLQueryItem(name: $0.key, value: $0.value) }
+        }
+        var request = URLRequest(url: components.url!, timeoutInterval: 10)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if status == 404 { return [:] }
+        if status == 401 || status == 403 {
+            // Revoked key or rotated token: drop it so the next build refetches.
+            await AppleMusicToken.shared.invalidate()
+            appleMusicToken = nil
+        }
+        guard status == 200 else { throw AppleMusicError.http(status) }
+        return (try JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+
+    /// The device's region when Apple Music sells there, else the US catalog.
+    /// Checked once per launch.
+    private func resolveStorefront() async {
+        guard !storefrontResolved, let token = appleMusicToken else { return }
+        storefrontResolved = true
+        let region = Locale.current.region?.identifier.lowercased() ?? "us"
+        guard region != "us", let url = URL(string: "\(Self.appleMusicBase)/storefronts/\(region)") else { return }
+        var request = URLRequest(url: url, timeoutInterval: 8)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if let (_, response) = try? await URLSession.shared.data(for: request),
+           (response as? HTTPURLResponse)?.statusCode == 200 {
+            appleMusicStorefront = region
+        }
+    }
+
+    /// The `data` array of one result type in a search response.
+    private func results(_ response: [String: Any], _ type: String) -> [[String: Any]] {
+        (((response["results"] as? [String: Any])?[type] as? [String: Any])?["data"] as? [[String: Any]]) ?? []
+    }
+
+    /// Songs among a `data` array (playlists also hold music videos, which
+    /// have no place in the game).
+    private func songs(in resources: Any?) -> [Track] {
+        ((resources as? [[String: Any]]) ?? []).compactMap { resource in
+            (resource["type"] as? String) == "songs" ? mapAppleMusicSong(resource) : nil
+        }
+    }
+
+    private func mapAppleMusicSong(_ resource: [String: Any]) -> Track? {
+        guard let id = resource["id"] as? String,
+              let attributes = resource["attributes"] as? [String: Any],
+              let name = attributes["name"] as? String else { return nil }
+        let albums = ((resource["relationships"] as? [String: Any])?["albums"] as? [String: Any])?["data"] as? [[String: Any]]
+        let artwork = (attributes["artwork"] as? [String: Any])?["url"] as? String
+        return Track(
+            id: id,
+            name: name,
+            artistName: attributes["artistName"] as? String ?? "",
+            albumName: attributes["albumName"] as? String ?? "",
+            albumId: albums?.first?["id"] as? String,
+            artworkUrl: artwork?.replacingOccurrences(of: "{w}", with: "300").replacingOccurrences(of: "{h}", with: "300"),
+            releaseDate: attributes["releaseDate"] as? String,
+            previewUrl: (attributes["previews"] as? [[String: Any]])?.first?["url"] as? String,
+            externalUrl: attributes["url"] as? String,
+            genreName: (attributes["genreNames"] as? [String])?.first,
+            isExplicit: (attributes["contentRating"] as? String) == "explicit"
         )
     }
 
-    private func chartGenre(for genre: String?) async throws -> Genre? {
-        guard let genre, let genreID = Self.genreIDs[genre] else { return nil }
-        if let cached = genreCache[genreID] { return cached }
-        let request = MusicCatalogResourceRequest<Genre>(matching: \.id, equalTo: MusicItemID(String(genreID)))
-        let response = try await request.response()
-        if let found = response.items.first {
-            genreCache[genreID] = found
-        }
-        return genreCache[genreID]
-    }
-
-    private func musicKitChartTracks(genre: String?) async throws -> [Track] {
-        let catalogGenre = try await chartGenre(for: genre)
+    private func appleMusicChartTracks(genre: String?) async throws -> [Track] {
         var tracks: [Track] = []
         for offset in [0, 50] {
-            var request = MusicCatalogChartsRequest(genre: catalogGenre, kinds: [.mostPlayed], types: [Song.self])
-            request.limit = 50
-            request.offset = offset
-            let response = try await request.response()
-            let songs = response.songCharts.first?.items ?? []
-            tracks += songs.map(mapSong)
-            if songs.count < 50 { break }
+            var query = ["types": "songs", "chart": "most-played", "limit": "50", "offset": String(offset)]
+            if let genre, let genreID = Self.genreIDs[genre] { query["genre"] = String(genreID) }
+            let response = try await appleMusicGET("/charts", query)
+            let chart = ((response["results"] as? [String: Any])?["songs"] as? [[String: Any]])?.first
+            let page = songs(in: chart?["data"])
+            tracks += page
+            if page.count < 50 { break }
         }
         return tracks
     }
 
-    private func musicKitSearchTracks(term: String) async throws -> [Track] {
+    private func appleMusicSearchTracks(term: String) async throws -> [Track] {
         var tracks: [Track] = []
         for offset in [0, 25] {
-            var request = MusicCatalogSearchRequest(term: term, types: [Song.self])
-            request.limit = 25
-            request.offset = offset
-            let response = try await request.response()
-            tracks += response.songs.map(mapSong)
-            if response.songs.count < 25 { break }
+            let response = try await appleMusicGET("/search", ["term": term, "types": "songs", "limit": "25", "offset": String(offset)])
+            let page = songs(in: results(response, "songs"))
+            tracks += page
+            if page.count < 25 { break }
         }
         return tracks
     }
 
-    private func musicKitAlbumTracks(albumId: String) async throws -> [Track] {
-        var request = MusicCatalogResourceRequest<Album>(matching: \.id, equalTo: MusicItemID(albumId))
-        request.properties = [.tracks]
-        let response = try await request.response()
-        guard let albumTracks = response.items.first?.tracks else { return [] }
-        return albumTracks.compactMap { item in
-            if case .song(let song) = item { return mapSong(song) }
-            return nil
+    /// Every song in a catalog playlist; Essentials run ~100, paged by 100.
+    private func appleMusicPlaylistTracks(id: String) async throws -> [Track] {
+        var tracks: [Track] = []
+        for offset in [0, 100] {
+            let response = try await appleMusicGET("/playlists/\(id)/tracks", ["limit": "100", "offset": String(offset)])
+            let page = response["data"] as? [[String: Any]] ?? []
+            tracks += songs(in: page)
+            if page.count < 100 { break }
         }
+        return tracks
     }
 
-    private func musicKitAlbumId(forSongId songId: String) async throws -> String? {
-        var request = MusicCatalogResourceRequest<Song>(matching: \.id, equalTo: MusicItemID(songId))
-        request.properties = [.albums]
-        let response = try await request.response()
-        return response.items.first?.albums?.first?.id.rawValue
+    private func appleMusicAlbumTracks(albumId: String) async throws -> [Track] {
+        songs(in: try await appleMusicGET("/albums/\(albumId)/tracks", ["limit": "100"])["data"])
+    }
+
+    private func appleMusicAlbumId(forSongId songId: String) async throws -> String? {
+        let albums = try await appleMusicGET("/songs/\(songId)/albums")["data"] as? [[String: Any]]
+        return albums?.first?["id"] as? String
     }
 
     // MARK: - iTunes backend (no key required)
