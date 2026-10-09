@@ -1002,13 +1002,8 @@ struct GameSetupView: View {
     }
 
     private var familyFriendlySection: some View {
-        HStack(alignment: .firstTextBaseline) {
-            VStack(alignment: .leading, spacing: 2) {
-                sectionLabel("FAMILY FRIENDLY")
-                Text("Skips songs marked explicit")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
+        HStack {
+            sectionLabel("FAMILY FRIENDLY")
             Spacer()
             Toggle("", isOn: Binding(
                 get: { gameManager.gameSettings.familyFriendly },
